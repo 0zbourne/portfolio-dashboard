@@ -202,67 +202,207 @@ c3.metric("Market Value (GBP)", f"£{df['market_value_gbp'].sum():,.0f}")
 
 st.caption("GBX handled automatically; USD converted via the sidebar rate.")
 
-# ---------- Holdings: show prices & avg cost in native currency; GBP only for portfolio value ----------
+# =======================
+# Dividends loader (T212 schema: {items:[...], nextPagePath})
+# =======================
+DIV_FILE = Path("data") / "dividends.json"
+
+@st.cache_data
+def load_dividends_t212(path=DIV_FILE):
+    if not path.exists():
+        return None, "File not found"
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    items = raw.get("items", [])
+    if not isinstance(items, list) or len(items) == 0:
+        return None, "No items in dividends.json"
+
+    df_div = pd.json_normalize(items)
+
+    # Keep only dividend cash events; drop interest/adjustments
+    if "type" in df_div.columns:
+        allowed = {"DIVIDEND", "DIVIDEND_CASH", "CASH_DIVIDEND"}
+        df_div = df_div[df_div["type"].astype(str).str.upper().isin(allowed)]
+
+    # Exclude interest-like rows
+    if "reference" in df_div.columns:
+        df_div = df_div[~df_div["reference"].astype(str).str.contains("interest", case=False, na=False)]
+
+    # Expect paidOn + amount
+    if "paidOn" not in df_div.columns or "amount" not in df_div.columns:
+        return None, f"Unexpected columns: {list(df_div.columns)}"
+
+    # Robust date parse
+    paid = df_div["paidOn"].astype(str).str.strip().str.replace("Z", "", regex=False)
+    dt = pd.to_datetime(paid, errors="coerce")
+    if dt.isna().all():
+        dt = pd.to_datetime(paid, format="%Y-%m-%d", errors="coerce")
+    if dt.isna().all():
+        dt = pd.to_datetime(paid, unit="ms", errors="coerce")
+
+    df_div["dt"] = dt
+    if df_div["dt"].isna().all():
+        return None, "Could not parse 'paidOn' dates."
+
+    out = (
+        pd.DataFrame({
+            "dt": df_div["dt"],
+            "ticker": df_div.get("ticker"),
+            "amount_gbp": pd.to_numeric(df_div["amount"], errors="coerce"),  # Account currency is GBP
+        })
+        .dropna(subset=["dt", "amount_gbp"])
+        .sort_values("dt")
+    )
+    return out, None
+
+# ---------- Holdings: richer table (native prices, GBP values, returns) ----------
 st.subheader("Holdings")
 
-# 1) Find avg cost per share from T212 payload (best-effort)
+# 1) Avg cost per share from payload (best-effort, still native)
 avg_candidates = [c for c in df.columns if "average" in c.lower() and "price" in c.lower()]
 df["avg_cost_raw"] = pd.to_numeric(df[avg_candidates[0]], errors="coerce") if avg_candidates else None
 
 # 2) Listing currency from symbol
 def _ccy(sym: str) -> str:
     return "USD" if "_US_" in str(sym) else "GBP"
-
 df["ccy"] = df["symbol"].apply(_ccy)
 
-# 3) Native price & native avg cost (don’t FX-convert here)
+# 3) Native price & native avg cost (no FX)
 def _price_native(row):
     p = row["price_raw"]
-    if p is None or pd.isna(p): return None
+    if p is None or pd.isna(p):
+        return None
     p = float(p)
     if row["ccy"] == "USD":
-        return p                    # already USD
-    return p/100.0 if p > 1000 else p   # GBX → GBP for UK tickers
+        return p                   # already USD
+    return p/100.0 if p > 1000 else p   # GBX → GBP for UK listings
 
 def _avg_native(row):
     x = row["avg_cost_raw"]
-    if x is None or pd.isna(x): return None
+    if x is None or pd.isna(x):
+        return None
     x = float(x)
     if row["ccy"] == "USD":
-        return x                    # keep USD; do NOT guess FX
-    return x/100.0 if x > 1000 else x   # GBX → GBP for UK tickers
+        return x                   # keep USD; do NOT guess FX
+    return x/100.0 if x > 1000 else x   # GBX → GBP for UK listings
 
 df["price_native"]    = df.apply(_price_native, axis=1)
 df["avg_cost_native"] = df.apply(_avg_native, axis=1)
 
-# ---- P/L % in the native currency (avoids FX noise) ----
-df["pl_pct_native"] = (
-    (df["price_native"] - df["avg_cost_native"]) / df["avg_cost_native"] * 100
-)
+# --- Dividends per ticker (GBP) ---
+div_tbl, _div_err = load_dividends_t212(Path("data") / "dividends.json")
+if _div_err is None and div_tbl is not None:
+    by_ticker = (
+        div_tbl.groupby("ticker", as_index=False)["amount_gbp"].sum()
+               .rename(columns={"ticker": "symbol", "amount_gbp": "dividends_gbp"})
+    )
+    df = df.merge(by_ticker, on="symbol", how="left")
+else:
+    df["dividends_gbp"] = None
 
-# 4) GBP portfolio value (we already computed market_value_gbp earlier)
+# --- TRUE GBP cost basis from transactions (buys only) ---
+true_costs, tc_err = load_true_avg_cost(Path("data") / "transactions.json")
+if tc_err is None and true_costs is not None:
+    df = df.merge(true_costs[["symbol", "true_avg_cost_gbp"]], on="symbol", how="left")
+    df["cost_basis_gbp"] = df["true_avg_cost_gbp"] * df["shares"]
+else:
+    df["true_avg_cost_gbp"] = None
+    df["cost_basis_gbp"] = None
+
+# --- Portfolio value in GBP (already computed earlier) ---
 df["total_value_gbp"] = df["market_value_gbp"]
 portfolio_total = df["total_value_gbp"].sum()
 df["weight_pct"] = (df["total_value_gbp"] / portfolio_total) * 100
 
-# 5) Pretty display strings (native currency)
-def _fmt(val, ccy):
-    if val is None or pd.isna(val): return ""
-    return f"${val:,.2f}" if ccy == "USD" else f"£{val:,.2f}"
+# --- Day change: detect a 'previous close' and compute change ---
+_prev_close_candidates = [
+    "previousClose","prevClose","lastClose","closePrevious",
+    "pricePrevClose","previous_close","priorClose"
+]
+prev_col = next((c for c in _prev_close_candidates if c in df.columns), None)
 
-df["price_display"]    = df.apply(lambda r: _fmt(r["price_native"],    r["ccy"]), axis=1)
-df["avg_cost_display"] = df.apply(lambda r: _fmt(r["avg_cost_native"], r["ccy"]), axis=1)
+if prev_col:
+    def _prev_native(row):
+        v = row[prev_col]
+        if v is None or pd.isna(v): return None
+        v = float(v)
+        return v if row["ccy"] == "USD" else (v / 100.0 if v > 1000 else v)
 
-# 6) Table (no P/L until we wire true GBP cost from transactions)
+    df["prev_close_native"] = df.apply(_prev_native, axis=1)
+    df["day_change_native"] = df["price_native"] - df["prev_close_native"]
+    # £ day change converts USD rows with FX
+    df["day_change_gbp"] = df.apply(
+        lambda r: r["shares"] * (r["day_change_native"] * (usd_to_gbp if r["ccy"] == "USD" else 1.0))
+        if pd.notna(r["day_change_native"]) else None,
+        axis=1
+    )
+    df["day_change_pct"] = (df["price_native"] / df["prev_close_native"] - 1.0) * 100
+else:
+    df["day_change_native"] = None
+    df["day_change_gbp"] = None
+    df["day_change_pct"] = None
+
+# 4) Day change (best-effort if present in your payload; otherwise blanks)
+def _find_col(cols, needles):
+    low = [c.lower() for c in cols]
+    for n in needles:
+        if n in low:
+            return cols[low.index(n)]
+    return None
+
+# try a few common field names users see in T212 exports / APIs
+chg_abs_col = None
+for key in ["change", "daychange", "dailychange", "pricechange", "day_change"]:
+    chg_abs_col = _find_col(df.columns, [key])
+    if chg_abs_col: break
+
+chg_pct_col = None
+for key in ["changepct", "daychangepct", "dailychangepct", "pricechangepct", "day_change_pct"]:
+    chg_pct_col = _find_col(df.columns, [key])
+    if chg_pct_col: break
+
+if chg_abs_col:
+    df["day_change_gbp"] = pd.to_numeric(df[chg_abs_col], errors="coerce")
+    # If native USD, convert to GBP so it matches “Holding Value”
+    usd_mask = df["ccy"].eq("USD") & df["day_change_gbp"].notna()
+    df.loc[usd_mask, "day_change_gbp"] = df.loc[usd_mask, "day_change_gbp"].astype(float) * float(usd_to_gbp)
+else:
+    df["day_change_gbp"] = float('nan')
+
+if chg_pct_col:
+    df["day_change_pct"] = pd.to_numeric(df[chg_pct_col], errors="coerce")
+else:
+    df["day_change_pct"] = float('nan')
+
+# 8) Capital gains (GBP) & total return (GBP / %)
+# Use true GBP avg cost when we have it; otherwise NaN to avoid FX-guessing.
+df["cost_basis_gbp"] = df["shares"] * df["true_avg_cost_gbp"]
+df["capital_gains_gbp"] = df["total_value_gbp"] - df["cost_basis_gbp"]
+df.loc[df["cost_basis_gbp"].isna(), "capital_gains_gbp"] = float('nan')
+
+df["total_return_gbp"] = df["capital_gains_gbp"] + df["dividends_gbp"]
+df["total_return_pct"] = (df["total_return_gbp"] / df["cost_basis_gbp"]) * 100
+df.loc[df["cost_basis_gbp"].isna(), ["total_return_gbp", "total_return_pct"]] = float('nan')
+
+# 9) Native P/L % (price vs avg in native currency, FX-free)
+df["pl_pct_native"] = (
+    (df["price_native"] - df["avg_cost_native"]) / df["avg_cost_native"] * 100
+)
+
+# 10) Build the display table
 view = df[[
-    "company",           # pretty name (Shown)
-    # "symbol",            # ticker
+    "company",
     "shares",
-    "ccy",               # native currency (USD/GBP)
-    "price_native",      # numeric native price
-    "avg_cost_native",   # numeric native avg cost
-    "pl_pct_native",     # % gain in native currency
-    "total_value_gbp",   # GBP for portfolio context
+    "ccy",
+    "price_native",
+    "avg_cost_native",
+    "day_change_gbp",
+    "day_change_pct",
+    "total_return_gbp",
+    "total_return_pct",
+    "dividends_gbp",
+    "capital_gains_gbp",
+    "total_value_gbp",   # <— add this
     "weight_pct",
 ]].copy()
 
@@ -272,81 +412,29 @@ st.dataframe(
     hide_index=True,
     column_config={
         "company": "Name",
-        "shares": st.column_config.NumberColumn("Shares", format="%.0f"),
+        "shares": st.column_config.NumberColumn("No. of Shares", format="%.0f"),
         "ccy": st.column_config.TextColumn("Ccy"),
-        # Show native numbers with two decimals (no symbol since ccy varies by row)
-        "price_native":     st.column_config.NumberColumn("Price (native)",     format="%.2f"),
-        "avg_cost_native":  st.column_config.NumberColumn("Avg Cost (native)",  format="%.2f"),
-        "pl_pct_native":    st.column_config.NumberColumn("P/L % (native)",     format="%.2f%%"),
-        "total_value_gbp":  st.column_config.NumberColumn("Total Value (GBP)",  format="£%.0f"),
-        "weight_pct":       st.column_config.NumberColumn("Weight %",           format="%.2f%%"),
+        "price_native":    st.column_config.NumberColumn("Live Share Price",  format="%.2f"),
+        "avg_cost_native": st.column_config.NumberColumn("Avg. Share Price",  format="%.2f"),
+        "day_change_gbp":  st.column_config.NumberColumn("Day Change £",      format="£%.0f"),
+        "day_change_pct":  st.column_config.NumberColumn("Day Change %",      format="%.2f%%"),
+        "total_return_gbp":st.column_config.NumberColumn("Total Return £",    format="£%.0f"),
+        "total_return_pct":st.column_config.NumberColumn("Total Return %",    format="%.2f%%"),
+        "dividends_gbp":   st.column_config.NumberColumn("Dividends",         format="£%.0f"),
+        "capital_gains_gbp": st.column_config.NumberColumn("Capital Gains",   format="£%.0f"),
+        "total_value_gbp": st.column_config.NumberColumn("Holding Value", format="£%.0f"),
+        "weight_pct":      st.column_config.NumberColumn("Weight %",          format="%.2f%%"),
     },
 )
 
-st.caption(
-    "Name is sourced from T212 when available (or instruments.json if present, "
-    "otherwise a cleaned ticker). Prices & average costs are shown in the instrument’s "
-    "native currency; portfolio totals/weights are in GBP using the FX rate on the left. "
-    "P/L % is in the native currency. Import BUY history to compute true GBP cost basis if needed."
-)
-
-
-# =======================
-# Dividends timeline (T212 schema: {items:[...], nextPagePath})
-# =======================
-DIV_FILE = Path("data") / "dividends.json"
-
-@st.cache_data
-def load_dividends_t212(path=DIV_FILE):
-    if not path.exists():
-        return None, "File not found"
-
-    import json
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    items = raw.get("items", [])
-    if not isinstance(items, list) or len(items) == 0:
-        return None, "No items in dividends.json"
-
-    df = pd.json_normalize(items) 
-
-    # Keep only actual dividend cash events; drop interest/adjustments
-    if "type" in df.columns:
-        allowed = {"DIVIDEND", "DIVIDEND_CASH", "CASH_DIVIDEND"}
-        df = df[df["type"].astype(str).str.upper().isin(allowed)]
-
-    # Some feeds label interest in 'reference'—exclude those too
-    if "reference" in df.columns:
-        df = df[~df["reference"].astype(str).str.contains("interest", case=False, na=False)]
-
-    # Drop rows with no paidOn entirely – they create the NaT bucket later
-    df = df[ df["paidOn"].notna() ]
-    
-    # Expect: ['ticker','reference','quantity','amount','grossAmountPerShare','amountInEuro','paidOn','type']
-    if "paidOn" not in df.columns or "amount" not in df.columns:
-        return None, f"Unexpected columns: {list(df.columns)}"
-
-    # --- robust date parse (ALL INSIDE the function) ---
-    paid = df["paidOn"].astype(str).str.strip().str.replace("Z", "", regex=False)
-    dt = pd.to_datetime(paid, errors="coerce")                      # try ISO
-    if dt.isna().all():
-        dt = pd.to_datetime(paid, format="%Y-%m-%d", errors="coerce")
-    if dt.isna().all():
-        dt = pd.to_datetime(paid, unit="ms", errors="coerce")
-
-    df["dt"] = dt
-    if df["dt"].isna().all():
-        return None, f"Could not parse 'paidOn'. Examples: {paid.head(3).tolist()}"
-
-    out = (
-        pd.DataFrame({
-            "dt": df["dt"],
-            "ticker": df.get("ticker"),
-            "amount_gbp": pd.to_numeric(df["amount"], errors="coerce"),  # T212 posts in account currency (GBP)
-        })
-        .dropna(subset=["dt", "amount_gbp"])
-        .sort_values("dt")
-    )
-    return out, None
+# Helpful notes for what’s estimated/missing
+notes = []
+if tc_err is not None:
+    notes.append("Capital gains & Total return need **transactions.json** (BUY history) to compute true GBP cost basis.")
+if chg_abs_col is None and chg_pct_col is None:
+    notes.append("Day change columns weren’t found in your data; columns show ‘—’.")
+if notes:
+    st.caption(" • ".join(notes))
 
 # ---- Render dividends timeline ----
 from pandas.api.types import is_datetime64_any_dtype as is_datetime
