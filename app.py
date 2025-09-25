@@ -50,19 +50,68 @@ c3.metric("Market Value (GBP)", f"£{df['market_value_gbp'].sum():,.0f}")
 
 st.caption("GBX handled automatically; USD converted via the sidebar rate.")
 
-# Table
+# ---------- Curated Holdings Table (signals-first) ----------
 st.subheader("Holdings")
-st.dataframe(
-    df[["symbol","shares","price_gbp","market_value_gbp"]]
-      .sort_values("market_value_gbp", ascending=False),
-    use_container_width=True,
-)
 
-# Quick weights chart
-st.subheader("Weights by Holding")
-weights = df[["symbol","market_value_gbp"]].sort_values("market_value_gbp", ascending=False)
-weights["weight_%"] = (weights["market_value_gbp"] / weights["market_value_gbp"].sum()) * 100
-st.bar_chart(weights, x="symbol", y="market_value_gbp", use_container_width=True)
+# 1) Find avg cost per share from T212 payload (best-effort)
+avg_candidates = [c for c in df.columns if "average" in c.lower() and "price" in c.lower()]
+if avg_candidates:
+    df["avg_cost_raw"] = pd.to_numeric(df[avg_candidates[0]], errors="coerce")
+else:
+    df["avg_cost_raw"] = None  # will show blanks until we map the exact key
+
+# 2) Convert avg cost to GBP using symbol heuristics (fix USD)
+def avg_to_gbp(row):
+    x = row["avg_cost_raw"]
+    if x is None or pd.isna(x):
+        return None
+    x = float(x)
+    sym = str(row["symbol"])
+    if "_US_" in sym:
+        # US listings: avg cost is in USD → convert to GBP via sidebar rate
+        return x * usd_to_gbp
+    # LSE listings: large numbers are GBX (pence) → scale to GBP
+    return x / 100.0 if x > 1000 else x
+
+df["avg_cost_gbp"] = df.apply(avg_to_gbp, axis=1)
+
+# 3) Core metrics (recompute after fixing avg cost FX)
+df["total_value_gbp"] = df["market_value_gbp"]
+df["cost_basis_gbp"]  = df["shares"] * df["avg_cost_gbp"]
+df["pl_gbp"] = df["total_value_gbp"] - df["cost_basis_gbp"]
+df["pl_pct"] = (df["pl_gbp"] / df["cost_basis_gbp"]) * 100
+
+portfolio_total = df["total_value_gbp"].sum()
+df["weight_pct"] = (df["total_value_gbp"] / portfolio_total) * 100
+
+# 4) Present only high-signal columns in priority order
+view = df[[
+    "symbol",             # Ticker
+    "shares",             # No. of shares
+    "price_gbp",          # Current share price
+    "avg_cost_gbp",       # Avg. price per share
+    "total_value_gbp",    # Total value
+    "pl_gbp",             # Total P/L (GBP)
+    "pl_pct",             # Total P/L %
+    "weight_pct",         # Portfolio weight %
+]].copy()
+
+# 5) Nice formatting
+st.dataframe(
+    view.sort_values("total_value_gbp", ascending=False),
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "symbol": "Ticker",
+        "shares": st.column_config.NumberColumn("Shares", format="%.0f"),
+        "price_gbp": st.column_config.NumberColumn("Price (GBP)", format="£%.2f"),
+        "avg_cost_gbp": st.column_config.NumberColumn("Avg Cost (GBP)", format="£%.2f"),
+        "total_value_gbp": st.column_config.NumberColumn("Total Value (GBP)", format="£%.0f"),
+        "pl_gbp": st.column_config.NumberColumn("P/L (GBP)", format="£%.0f"),
+        "pl_pct": st.column_config.NumberColumn("P/L %", format="%.2f%%"),
+        "weight_pct": st.column_config.NumberColumn("Weight %", format="%.2f%%"),
+    },
+)
 
 
 # =======================
