@@ -26,6 +26,21 @@ def load_portfolio():
 
 df = load_portfolio()
 
+# ---- Company name (best effort) ----
+name_col = next((c for c in df.columns
+                 if c.lower() in ["name", "instrument.name", "displayname", "company", "title"]), None)
+
+if name_col:
+    df["company"] = df[name_col].astype(str)
+else:
+    # fallback: tidy the T212 symbol
+    def _pretty(sym: str) -> str:
+        s = str(sym)
+        for tag in ["_US_EQ", "_EQ", "_US", "_GBX", "_GB"]:
+            s = s.replace(tag, "")
+        return s.replace("_", " ").strip()
+    df["company"] = df["symbol"].apply(_pretty)
+
 @st.cache_data
 def load_true_avg_cost(path: Path = Path("data") / "transactions.json"):
     """
@@ -186,6 +201,11 @@ def _avg_native(row):
 df["price_native"]    = df.apply(_price_native, axis=1)
 df["avg_cost_native"] = df.apply(_avg_native, axis=1)
 
+# ---- P/L % in the native currency (avoids FX noise) ----
+df["pl_pct_native"] = (
+    (df["price_native"] - df["avg_cost_native"]) / df["avg_cost_native"] * 100
+)
+
 # 4) GBP portfolio value (we already computed market_value_gbp earlier)
 df["total_value_gbp"] = df["market_value_gbp"]
 portfolio_total = df["total_value_gbp"].sum()
@@ -201,11 +221,14 @@ df["avg_cost_display"] = df.apply(lambda r: _fmt(r["avg_cost_native"], r["ccy"])
 
 # 6) Table (no P/L until we wire true GBP cost from transactions)
 view = df[[
-    "symbol",
+    "company",           # pretty name
+    "symbol",            # ticker
     "shares",
-    "price_display",       # native
-    "avg_cost_display",    # native
-    "total_value_gbp",     # GBP
+    "ccy",               # native currency (USD/GBP)
+    "price_native",      # numeric native price
+    "avg_cost_native",   # numeric native avg cost
+    "pl_pct_native",     # % gain in native currency
+    "total_value_gbp",   # GBP for portfolio context
     "weight_pct",
 ]].copy()
 
@@ -214,12 +237,16 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
     column_config={
+        "company": "Name",
         "symbol": "Ticker",
         "shares": st.column_config.NumberColumn("Shares", format="%.0f"),
-        "price_display": st.column_config.TextColumn("Price (native)"),
-        "avg_cost_display": st.column_config.TextColumn("Avg Cost (native)"),
-        "total_value_gbp": st.column_config.NumberColumn("Total Value (GBP)", format="£%.0f"),
-        "weight_pct": st.column_config.NumberColumn("Weight %", format="%.2f%%"),
+        "ccy": st.column_config.TextColumn("Ccy"),
+        # Show native numbers with two decimals (no symbol since ccy varies by row)
+        "price_native":     st.column_config.NumberColumn("Price (native)",     format="%.2f"),
+        "avg_cost_native":  st.column_config.NumberColumn("Avg Cost (native)",  format="%.2f"),
+        "pl_pct_native":    st.column_config.NumberColumn("P/L % (native)",     format="%.2f%%"),
+        "total_value_gbp":  st.column_config.NumberColumn("Total Value (GBP)",  format="£%.0f"),
+        "weight_pct":       st.column_config.NumberColumn("Weight %",           format="%.2f%%"),
     },
 )
 
