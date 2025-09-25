@@ -1,6 +1,9 @@
 import json, pandas as pd, streamlit as st
 from pathlib import Path
 
+import requests
+from datetime import datetime
+
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
 DATA = Path("data") / "portfolio.json"
@@ -23,9 +26,109 @@ def load_portfolio():
 
 df = load_portfolio()
 
+@st.cache_data
+def load_true_avg_cost(path: Path = Path("data") / "transactions.json"):
+    """
+    Compute true GBP average cost per ticker from T212 transactions history.
+    Formula: sum(GBP spent on BUYs incl. fees & stamp) / sum(shares bought).
+    Accepts either {"items":[...]} or a raw list.
+    Returns (df, err) where df has: symbol, shares_bought, total_spend_gbp, true_avg_cost_gbp
+    """
+    if not path.exists():
+        return None, "File not found"
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    items = raw.get("items", raw)
+    if not isinstance(items, list) or len(items) == 0:
+        return None, "No items in transactions.json"
+
+    t = pd.json_normalize(items)
+
+    # Try to auto-detect columns
+    action_col  = next((c for c in t.columns if c.lower() in {"action", "type"}), None)
+    ticker_col  = next((c for c in t.columns if "ticker" in c.lower()), None)
+    qty_col     = next((c for c in t.columns if "quantity" in c.lower() or "shares" in c.lower()), None)
+    total_col   = next((c for c in t.columns if "totalamount" in c.replace("_", "").lower() or c.lower() == "total"), None)
+    charge_col  = next((c for c in t.columns if "charge" in c.lower()), None)
+    stamp_col   = next((c for c in t.columns if "stamp" in c.lower()), None)
+
+    if any(c is None for c in [action_col, ticker_col, qty_col, total_col]):
+        return None, f"Unexpected schema. Columns: {list(t.columns)}"
+
+    # Coerce numeric
+    for c in [qty_col, total_col, charge_col, stamp_col]:
+        if c in t.columns:
+            t[c] = pd.to_numeric(t[c], errors="coerce")
+    if charge_col not in t.columns: t[charge_col] = 0.0
+    if stamp_col  not in t.columns: t[stamp_col]  = 0.0
+
+    # Keep BUYs
+    buys = t[t[action_col].astype(str).str.contains("buy", case=False, na=False)].copy()
+    if buys.empty:
+        return None, "No buy transactions found."
+
+    # T212 total amount is in ACCOUNT CURRENCY (GBP) → treat as GBP and add fees/stamp
+    buys["spend_gbp"] = buys[total_col].fillna(0) + buys[charge_col].fillna(0) + buys[stamp_col].fillna(0)
+
+    agg = (
+        buys.groupby(buys[ticker_col])
+            .agg(shares_bought=(qty_col, "sum"), total_spend_gbp=("spend_gbp", "sum"))
+            .reset_index()
+    )
+    agg.rename(columns={ticker_col: "symbol"}, inplace=True)
+    agg["true_avg_cost_gbp"] = agg["total_spend_gbp"] / agg["shares_bought"]
+    return agg, None
+
+@st.cache_data(ttl=6 * 3600)  # cache for 6 hours
+def get_usd_gbp_rate():
+    """
+    Returns (rate, source, fetched_at) or (None, None, None) on failure.
+    Tries two free endpoints: frankfurter.app (ECB) then exchangerate.host.
+    """
+    # Provider 1: frankfurter.app (ECB)
+    try:
+        r = requests.get(
+            "https://api.frankfurter.app/latest",
+            params={"from": "USD", "to": "GBP"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        rate = float(r.json()["rates"]["GBP"])
+        return rate, "frankfurter.app (ECB)", datetime.utcnow().isoformat() + "Z"
+    except Exception:
+        pass
+
+    # Provider 2: exchangerate.host
+    try:
+        r = requests.get(
+            "https://api.exchangerate.host/latest",
+            params={"base": "USD", "symbols": "GBP"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        rate = float(r.json()["rates"]["GBP"])
+        return rate, "exchangerate.host", datetime.utcnow().isoformat() + "Z"
+    except Exception:
+        pass
+
+    return None, None, None
+
 # ---- Sidebar: FX ----
 st.sidebar.header("Settings")
-usd_to_gbp = st.sidebar.number_input("USD → GBP rate", value=0.78, min_value=0.5, max_value=1.5, step=0.01)
+
+auto_rate, rate_src, fetched_at = get_usd_gbp_rate()
+if auto_rate is None:
+    st.sidebar.error("FX fetch failed. Using manual override.")
+    usd_to_gbp = st.sidebar.number_input("USD → GBP (manual)", value=0.78, min_value=0.5, max_value=1.5, step=0.01)
+else:
+    st.sidebar.metric("USD → GBP (auto)", f"{auto_rate:.4f}", help=f"Source: {rate_src}\nFetched: {fetched_at}")
+    # Optional: allow override if you want to test scenarios
+    if st.sidebar.toggle("Override FX rate", value=False, key="fx_override"):
+        usd_to_gbp = st.sidebar.number_input(
+            "USD → GBP (override)", value=float(f"{auto_rate:.4f}"), min_value=0.5, max_value=1.5, step=0.01
+        )
+    else:
+        usd_to_gbp = auto_rate
 
 # Convert to GBP:
 # - London listings in pence (GBX) already handled earlier (price_gbp_guess).
@@ -50,53 +153,62 @@ c3.metric("Market Value (GBP)", f"£{df['market_value_gbp'].sum():,.0f}")
 
 st.caption("GBX handled automatically; USD converted via the sidebar rate.")
 
-# ---------- Curated Holdings Table (signals-first) ----------
+# ---------- Holdings: show prices & avg cost in native currency; GBP only for portfolio value ----------
 st.subheader("Holdings")
 
 # 1) Find avg cost per share from T212 payload (best-effort)
 avg_candidates = [c for c in df.columns if "average" in c.lower() and "price" in c.lower()]
-if avg_candidates:
-    df["avg_cost_raw"] = pd.to_numeric(df[avg_candidates[0]], errors="coerce")
-else:
-    df["avg_cost_raw"] = None  # will show blanks until we map the exact key
+df["avg_cost_raw"] = pd.to_numeric(df[avg_candidates[0]], errors="coerce") if avg_candidates else None
 
-# 2) Convert avg cost to GBP using symbol heuristics (fix USD)
-def avg_to_gbp(row):
+# 2) Listing currency from symbol
+def _ccy(sym: str) -> str:
+    return "USD" if "_US_" in str(sym) else "GBP"
+
+df["ccy"] = df["symbol"].apply(_ccy)
+
+# 3) Native price & native avg cost (don’t FX-convert here)
+def _price_native(row):
+    p = row["price_raw"]
+    if p is None or pd.isna(p): return None
+    p = float(p)
+    if row["ccy"] == "USD":
+        return p                    # already USD
+    return p/100.0 if p > 1000 else p   # GBX → GBP for UK tickers
+
+def _avg_native(row):
     x = row["avg_cost_raw"]
-    if x is None or pd.isna(x):
-        return None
+    if x is None or pd.isna(x): return None
     x = float(x)
-    sym = str(row["symbol"])
-    if "_US_" in sym:
-        # US listings: avg cost is in USD → convert to GBP via sidebar rate
-        return x * usd_to_gbp
-    # LSE listings: large numbers are GBX (pence) → scale to GBP
-    return x / 100.0 if x > 1000 else x
+    if row["ccy"] == "USD":
+        return x                    # keep USD; do NOT guess FX
+    return x/100.0 if x > 1000 else x   # GBX → GBP for UK tickers
 
-df["avg_cost_gbp"] = df.apply(avg_to_gbp, axis=1)
+df["price_native"]    = df.apply(_price_native, axis=1)
+df["avg_cost_native"] = df.apply(_avg_native, axis=1)
 
-# 3) Core metrics (recompute after fixing avg cost FX)
+# 4) GBP portfolio value (we already computed market_value_gbp earlier)
 df["total_value_gbp"] = df["market_value_gbp"]
-df["cost_basis_gbp"]  = df["shares"] * df["avg_cost_gbp"]
-df["pl_gbp"] = df["total_value_gbp"] - df["cost_basis_gbp"]
-df["pl_pct"] = (df["pl_gbp"] / df["cost_basis_gbp"]) * 100
-
 portfolio_total = df["total_value_gbp"].sum()
 df["weight_pct"] = (df["total_value_gbp"] / portfolio_total) * 100
 
-# 4) Present only high-signal columns in priority order
+# 5) Pretty display strings (native currency)
+def _fmt(val, ccy):
+    if val is None or pd.isna(val): return ""
+    return f"${val:,.2f}" if ccy == "USD" else f"£{val:,.2f}"
+
+df["price_display"]    = df.apply(lambda r: _fmt(r["price_native"],    r["ccy"]), axis=1)
+df["avg_cost_display"] = df.apply(lambda r: _fmt(r["avg_cost_native"], r["ccy"]), axis=1)
+
+# 6) Table (no P/L until we wire true GBP cost from transactions)
 view = df[[
-    "symbol",             # Ticker
-    "shares",             # No. of shares
-    "price_gbp",          # Current share price
-    "avg_cost_gbp",       # Avg. price per share
-    "total_value_gbp",    # Total value
-    "pl_gbp",             # Total P/L (GBP)
-    "pl_pct",             # Total P/L %
-    "weight_pct",         # Portfolio weight %
+    "symbol",
+    "shares",
+    "price_display",       # native
+    "avg_cost_display",    # native
+    "total_value_gbp",     # GBP
+    "weight_pct",
 ]].copy()
 
-# 5) Nice formatting
 st.dataframe(
     view.sort_values("total_value_gbp", ascending=False),
     use_container_width=True,
@@ -104,15 +216,18 @@ st.dataframe(
     column_config={
         "symbol": "Ticker",
         "shares": st.column_config.NumberColumn("Shares", format="%.0f"),
-        "price_gbp": st.column_config.NumberColumn("Price (GBP)", format="£%.2f"),
-        "avg_cost_gbp": st.column_config.NumberColumn("Avg Cost (GBP)", format="£%.2f"),
+        "price_display": st.column_config.TextColumn("Price (native)"),
+        "avg_cost_display": st.column_config.TextColumn("Avg Cost (native)"),
         "total_value_gbp": st.column_config.NumberColumn("Total Value (GBP)", format="£%.0f"),
-        "pl_gbp": st.column_config.NumberColumn("P/L (GBP)", format="£%.0f"),
-        "pl_pct": st.column_config.NumberColumn("P/L %", format="%.2f%%"),
         "weight_pct": st.column_config.NumberColumn("Weight %", format="%.2f%%"),
     },
 )
 
+st.caption(
+    "Prices & average costs are shown in each instrument’s native currency. "
+    "Portfolio values are converted to GBP using the FX rate on the left. "
+    "P/L is hidden until we import BUY history to compute the true GBP cost basis."
+)
 
 # =======================
 # Dividends timeline (T212 schema: {items:[...], nextPagePath})
