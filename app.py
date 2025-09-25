@@ -26,20 +26,54 @@ def load_portfolio():
 
 df = load_portfolio()
 
-# ---- Company name (best effort) ----
-name_col = next((c for c in df.columns
-                 if c.lower() in ["name", "instrument.name", "displayname", "company", "title"]), None)
+# ---- Company / Instrument name (best effort, with optional instruments.json) ----
+name_like_cols = [
+    "name", "instrument.name", "displayName", "display_name",
+    "company", "title", "instrumentName", "instrument_name", "security.name"
+]
+name_col = next((c for c in df.columns if c in name_like_cols), None)
 
 if name_col:
     df["company"] = df[name_col].astype(str)
 else:
-    # fallback: tidy the T212 symbol
+    # Optional: merge from a local instruments export if you have it
+    def _load_instrument_names(path=Path("data") / "instruments.json"):
+        if not path.exists():
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        items = raw.get("items", raw)
+        m = pd.json_normalize(items)
+        tcol = next((c for c in m.columns if "ticker" in c.lower()), None)
+        ncol = next((c for c in m.columns if "name"   in c.lower()), None)
+        if tcol and ncol:
+            m = m[[tcol, ncol]].rename(columns={tcol: "symbol", ncol: "company"})
+            return m
+        return None
+
+    name_map = _load_instrument_names()
+
+    # Small built-in mapping you can extend
+    builtin_map = {
+        "GOOGL_US_EQ": "Alphabet Inc. (Class A)",
+        "MA_US_EQ":    "Mastercard Inc.",
+        "SPXLI_EQ":    "S&P 500 UCITS ETF (Acc)",
+        "GAWI_EQ":     "Gawain Plc",  # change to your actual LSE holding name
+    }
+    df["company"] = df["symbol"].map(builtin_map)
+
+    if name_map is not None:
+        df = df.merge(name_map, on="symbol", how="left", suffixes=("", "_from_map"))
+        df["company"] = df["company"].combine_first(df["company_from_map"])
+        if "company_from_map" in df.columns:
+            df.drop(columns=["company_from_map"], inplace=True)
+
+    # Final tidy fallback from ticker if still missing
     def _pretty(sym: str) -> str:
         s = str(sym)
         for tag in ["_US_EQ", "_EQ", "_US", "_GBX", "_GB"]:
             s = s.replace(tag, "")
         return s.replace("_", " ").strip()
-    df["company"] = df["symbol"].apply(_pretty)
+    df["company"] = df["company"].fillna(df["symbol"].apply(_pretty))
 
 @st.cache_data
 def load_true_avg_cost(path: Path = Path("data") / "transactions.json"):
@@ -221,8 +255,8 @@ df["avg_cost_display"] = df.apply(lambda r: _fmt(r["avg_cost_native"], r["ccy"])
 
 # 6) Table (no P/L until we wire true GBP cost from transactions)
 view = df[[
-    "company",           # pretty name
-    "symbol",            # ticker
+    "company",           # pretty name (Shown)
+    # "symbol",            # ticker
     "shares",
     "ccy",               # native currency (USD/GBP)
     "price_native",      # numeric native price
@@ -238,7 +272,6 @@ st.dataframe(
     hide_index=True,
     column_config={
         "company": "Name",
-        "symbol": "Ticker",
         "shares": st.column_config.NumberColumn("Shares", format="%.0f"),
         "ccy": st.column_config.TextColumn("Ccy"),
         # Show native numbers with two decimals (no symbol since ccy varies by row)
@@ -251,10 +284,12 @@ st.dataframe(
 )
 
 st.caption(
-    "Prices & average costs are shown in each instrument’s native currency. "
-    "Portfolio values are converted to GBP using the FX rate on the left. "
-    "P/L is hidden until we import BUY history to compute the true GBP cost basis."
+    "Name is sourced from T212 when available (or instruments.json if present, "
+    "otherwise a cleaned ticker). Prices & average costs are shown in the instrument’s "
+    "native currency; portfolio totals/weights are in GBP using the FX rate on the left. "
+    "P/L % is in the native currency. Import BUY history to compute true GBP cost basis if needed."
 )
+
 
 # =======================
 # Dividends timeline (T212 schema: {items:[...], nextPagePath})
