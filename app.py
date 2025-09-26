@@ -4,6 +4,30 @@ from pathlib import Path
 import requests
 from datetime import datetime
 
+import os
+
+# --- Fetch helper to refresh local JSONs from T212 API ---
+def fetch_to_file(url: str, out_path: Path):
+    headers = {"Authorization": API_KEY, "Accept": "application/json"} # <-- adjust if your API wants 'Apikey ' or similar
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        st.sidebar.success(f"Fetched {out_path.name}")
+        return data
+    except Exception as e:
+        st.sidebar.error(f"Fetch failed for {url}: {e}")
+        return None
+
+API_KEY = os.getenv("T212_API_KEY")
+if not API_KEY:
+    st.error("Missing T212 API key — set it with setx T212_API_KEY ...")
+    st.stop()
+
+BASE = os.getenv("T212_API_BASE", "https://live.trading212.com") # use https://demo.trading212.com for practice  # practice API host
+
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
 DATA = Path("data") / "portfolio.json"
@@ -24,6 +48,12 @@ def load_portfolio():
 
     return df
 
+# --- Refresh JSONs on each run (or comment out if you want manual refresh only) ---
+fetch_to_file(f"{BASE}/api/v0/equity/portfolio",     Path("data/portfolio.json"))
+fetch_to_file(f"{BASE}/api/v0/history/transactions", Path("data/transactions.json"))
+fetch_to_file(f"{BASE}/api/v0/history/dividends",    Path("data/dividends.json"))
+
+# Now load from disk as before
 df = load_portfolio()
 
 # ---- Company / Instrument name (best effort, with optional instruments.json) ----
