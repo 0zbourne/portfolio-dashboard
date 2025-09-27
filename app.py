@@ -8,6 +8,7 @@ import os
 
 # --- Fetch helper to refresh local JSONs from T212 API ---
 def fetch_to_file(url: str, out_path: Path):
+    # headers = {"Authorization": f"Apikey {API_KEY}", "Accept": "application/json"}
     headers = {"Authorization": API_KEY, "Accept": "application/json"} # <-- adjust if your API wants 'Apikey ' or similar
     try:
         r = requests.get(url, headers=headers, timeout=20)
@@ -49,9 +50,26 @@ def load_portfolio():
     return df
 
 # --- Refresh JSONs on each run (or comment out if you want manual refresh only) ---
-fetch_to_file(f"{BASE}/api/v0/equity/portfolio",     Path("data/portfolio.json"))
-fetch_to_file(f"{BASE}/api/v0/history/transactions", Path("data/transactions.json"))
-fetch_to_file(f"{BASE}/api/v0/history/dividends",    Path("data/dividends.json"))
+HIST_FROM = "1970-01-01"
+HIST_TO   = "2100-01-01" # Wide date range so history isn't empty
+
+fetch_to_file(f"{BASE}/api/v0/equity/portfolio", Path("data/portfolio.json"))
+fetch_to_file(
+    f"{BASE}/api/v0/history/transactions?from={HIST_FROM}&to={HIST_TO}",
+    Path("data/transactions.json")
+)
+fetch_to_file(
+    f"{BASE}/api/v0/history/dividends?from={HIST_FROM}&to={HIST_TO}",
+    Path("data/dividends.json")
+)
+
+# Warning if files are empty
+for p in [Path("data/portfolio.json"), Path("data/transactions.json"), Path("data/dividends.json")]:
+    try:
+        if p.stat().st_size < 10:  # tiny file likely empty/error
+            st.sidebar.warning(f"{p.name} looks empty. Check API key/permissions and base URL.")
+    except FileNotFoundError:
+        st.sidebar.warning(f"{p.name} not found after fetch.")
 
 # Now load from disk as before
 df = load_portfolio()
@@ -344,12 +362,15 @@ df["total_value_gbp"] = df["market_value_gbp"]
 portfolio_total = df["total_value_gbp"].sum()
 df["weight_pct"] = (df["total_value_gbp"] / portfolio_total) * 100
 
-# --- Day change: detect a 'previous close' and compute change ---
+# --- Day change (try prev close first; then wide-net fallbacks) ---
 _prev_close_candidates = [
     "previousClose","prevClose","lastClose","closePrevious",
     "pricePrevClose","previous_close","priorClose"
 ]
 prev_col = next((c for c in _prev_close_candidates if c in df.columns), None)
+
+df["day_change_gbp"] = float("nan")
+df["day_change_pct"] = float("nan")
 
 if prev_col:
     def _prev_native(row):
@@ -360,59 +381,64 @@ if prev_col:
 
     df["prev_close_native"] = df.apply(_prev_native, axis=1)
     df["day_change_native"] = df["price_native"] - df["prev_close_native"]
-    # £ day change converts USD rows with FX
+
+    # absolute £ day change
     df["day_change_gbp"] = df.apply(
         lambda r: r["shares"] * (r["day_change_native"] * (usd_to_gbp if r["ccy"] == "USD" else 1.0))
-        if pd.notna(r["day_change_native"]) else None,
+        if pd.notna(r["day_change_native"]) else float("nan"),
         axis=1
     )
+    # % day change
     df["day_change_pct"] = (df["price_native"] / df["prev_close_native"] - 1.0) * 100
-else:
-    df["day_change_native"] = None
-    df["day_change_gbp"] = None
-    df["day_change_pct"] = None
 
-# 4) Day change (best-effort if present in your payload; otherwise blanks)
-def _find_col(cols, needles):
-    low = [c.lower() for c in cols]
-    for n in needles:
-        if n in low:
-            return cols[low.index(n)]
+# ---- Fallbacks if the API didn't give us a previous close ----
+def _pick(colnames, must_have_any, also_any=None):
+    """Pick first column whose name contains ALL tokens in `must_have_any`
+       and (if provided) ANY token in `also_any` (case-insensitive)."""
+    low = {c: c.lower() for c in colnames}
+    for c, lc in low.items():
+        if all(tok in lc for tok in must_have_any) and (not also_any or any(tok in lc for tok in also_any)):
+            return c
     return None
 
-# try a few common field names users see in T212 exports / APIs
-chg_abs_col = None
-for key in ["change", "daychange", "dailychange", "pricechange", "day_change"]:
-    chg_abs_col = _find_col(df.columns, [key])
-    if chg_abs_col: break
+if df["day_change_gbp"].isna().all():
+    # absolute “today/day” PnL or change
+    abs_col = _pick(df.columns, ["day"], ["pnl","pl","change","chg","diff","ret"]) \
+          or  _pick(df.columns, ["today"], ["pnl","pl","change","chg","diff","ret"])
+    if abs_col:
+        vals = pd.to_numeric(df[abs_col], errors="coerce")
+        df["day_change_gbp"] = df.apply(
+            lambda r: (vals.loc[r.name] * (usd_to_gbp if r["ccy"] == "USD" else 1.0))
+            if pd.notna(vals.loc[r.name]) else float("nan"),
+            axis=1
+        )
 
-chg_pct_col = None
-for key in ["changepct", "daychangepct", "dailychangepct", "pricechangepct", "day_change_pct"]:
-    chg_pct_col = _find_col(df.columns, [key])
-    if chg_pct_col: break
+    # percentage “today/day”
+    pct_col = _pick(df.columns, ["day"],   ["pct","percent","%","ret"]) \
+          or  _pick(df.columns, ["today"], ["pct","percent","%","ret"])
+    if pct_col:
+        df["day_change_pct"] = pd.to_numeric(df[pct_col], errors="coerce")
 
-if chg_abs_col:
-    df["day_change_gbp"] = pd.to_numeric(df[chg_abs_col], errors="coerce")
-    # If native USD, convert to GBP so it matches “Holding Value”
-    usd_mask = df["ccy"].eq("USD") & df["day_change_gbp"].notna()
-    df.loc[usd_mask, "day_change_gbp"] = df.loc[usd_mask, "day_change_gbp"].astype(float) * float(usd_to_gbp)
-else:
-    df["day_change_gbp"] = float('nan')
-
-if chg_pct_col:
-    df["day_change_pct"] = pd.to_numeric(df[chg_pct_col], errors="coerce")
-else:
-    df["day_change_pct"] = float('nan')
+def _gbp_from_native(row, x):
+    if pd.isna(x): 
+        return float("nan")
+    return float(x) * (usd_to_gbp if row["ccy"] == "USD" else 1.0)
 
 # 8) Capital gains (GBP) & total return (GBP / %)
-# Use true GBP avg cost when we have it; otherwise NaN to avoid FX-guessing.
+# Preferred: true GBP cost from transactions.json (already GBP)
 df["cost_basis_gbp"] = df["shares"] * df["true_avg_cost_gbp"]
-df["capital_gains_gbp"] = df["total_value_gbp"] - df["cost_basis_gbp"]
-df.loc[df["cost_basis_gbp"].isna(), "capital_gains_gbp"] = float('nan')
 
-df["total_return_gbp"] = df["capital_gains_gbp"] + df["dividends_gbp"]
-df["total_return_pct"] = (df["total_return_gbp"] / df["cost_basis_gbp"]) * 100
-df.loc[df["cost_basis_gbp"].isna(), ["total_return_gbp", "total_return_pct"]] = float('nan')
+# Fallback: approximate cost from avg_cost_native (FX-adjust USD rows)
+approx_cost_each_gbp = df.apply(lambda r: _gbp_from_native(r, r["avg_cost_native"]), axis=1)
+df["cost_basis_gbp_approx"] = df["shares"] * approx_cost_each_gbp
+
+# Use true when available; otherwise approx
+df["cost_basis_gbp_effective"] = df["cost_basis_gbp"].combine_first(df["cost_basis_gbp_approx"])
+
+# Gains & returns
+df["capital_gains_gbp"] = df["total_value_gbp"] - df["cost_basis_gbp_effective"]
+df["total_return_gbp"]  = df["capital_gains_gbp"] + df["dividends_gbp"]
+df["total_return_pct"]  = (df["total_return_gbp"] / df["cost_basis_gbp_effective"]) * 100
 
 # 9) Native P/L % (price vs avg in native currency, FX-free)
 df["pl_pct_native"] = (
@@ -459,10 +485,10 @@ st.dataframe(
 
 # Helpful notes for what’s estimated/missing
 notes = []
-if tc_err is not None:
-    notes.append("Capital gains & Total return need **transactions.json** (BUY history) to compute true GBP cost basis.")
-if chg_abs_col is None and chg_pct_col is None:
-    notes.append("Day change columns weren’t found in your data; columns show ‘—’.")
+if df["true_avg_cost_gbp"].isna().any():
+    notes.append("Using **approximate cost basis** from average price for some rows (FX-adjusted). Upload transactions.json for true GBP cost.")
+if df["day_change_gbp"].isna().all():
+    notes.append("Could not find day-change fields in the payload; columns show ‘—’.")
 if notes:
     st.caption(" • ".join(notes))
 
