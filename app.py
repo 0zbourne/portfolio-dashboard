@@ -2,7 +2,7 @@ import json, pandas as pd, streamlit as st
 from pathlib import Path
 
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import os
 
@@ -48,13 +48,26 @@ def _save_open_prices(dct):
     OPEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     OPEN_FILE.write_text(json.dumps(dct, indent=2), encoding="utf-8")
 
+def _anchor_date_iso():
+    """
+    Use UTC date, but roll back to last business day if it's Saturday/Sunday.
+    Sat = 5, Sun = 6
+    """
+    d = datetime.utcnow().date()
+    if d.weekday() == 5:      # Saturday
+        d = d.replace(day=d.day)  # no-op for clarity
+        d = d - timedelta(days=1)  # Friday
+    elif d.weekday() == 6:    # Sunday
+        d = d - timedelta(days=2)  # Friday
+    return d.isoformat()
+
 def ensure_today_open_prices(df):
     """
     Ensure we have an 'open price' for each symbol for today's date.
     If missing, use current price_native as the 'open' anchor.
     Returns (store_dict, today_key).
     """
-    today = datetime.utcnow().date().isoformat()  # change to local date if you prefer
+    today = _anchor_date_iso()
     store = _load_open_prices()
     day_bucket = store.get(today, {})
 
@@ -70,7 +83,11 @@ def ensure_today_open_prices(df):
     return store, today
 
 @st.cache_data
-def load_portfolio():
+def load_portfolio(cache_bust: tuple):
+    """
+    Cache-busted by the portfolio.json file's (mtime, size).
+    Passing this tuple forces Streamlit to reload when the file changes.
+    """
     with open(DATA, "r", encoding="utf-8") as f:
         items = json.load(f)
     df = pd.DataFrame(items)
@@ -107,8 +124,9 @@ for p in [Path("data/portfolio.json"), Path("data/transactions.json"), Path("dat
     except FileNotFoundError:
         st.sidebar.warning(f"{p.name} not found after fetch.")
 
-# Now load from disk as before
-df = load_portfolio()
+# Now load from disk (cache-busted by file stats so prices refresh)
+_stat = DATA.stat()
+df = load_portfolio((_stat.st_mtime, _stat.st_size))
 
 # --- DEBUG: show columns & a few rows so we can see what T212 returns
 with st.sidebar.expander("Debug: portfolio columns", expanded=False):
@@ -272,7 +290,7 @@ with st.sidebar.expander("Day change settings", expanded=False):
     if st.button("Reset today’s open prices"):
         # wipe only today's bucket
         _store = _load_open_prices()
-        _store[datetime.utcnow().date().isoformat()] = {}
+        _store[_anchor_date_iso()] = {}
         _save_open_prices(_store)
         st.success("Today's open prices reset. Reload to re-anchor.")
 
