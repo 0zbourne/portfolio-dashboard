@@ -697,3 +697,44 @@ else:
 
     st.bar_chart(monthly, x="year_month", y="amount_gbp", use_container_width=True)
     st.caption("Monthly dividend cash received (GBP).")
+
+# =======================
+# Backend performance plumbing (no UI yet)
+# =======================
+from jobs.snapshot import append_today_snapshot_if_missing
+from pdperf.series import read_nav, daily_returns_twr, cumulative_return, cagr
+from pdperf.cashflows import build_cash_flows
+from bench.sp500 import get_sp500_daily
+
+# 1) Persist today's NAV snapshot (creates/updates data/nav_daily.csv)
+try:
+    append_today_snapshot_if_missing(df)
+except Exception as e:
+    st.sidebar.warning(f"NAV snapshot not updated: {e}")
+
+# 2) (Optional debug) Compute YTD absolute performance vs S&P 500 in GBP
+#    This only shows a quick caption in the sidebar; the real UI will come later.
+try:
+    year_start = f"{datetime.utcnow().year}-01-01"
+    today_key = _anchor_date_iso()
+
+    nav = read_nav()
+    flows = build_cash_flows(Path("data") / "transactions.json")
+    port_daily = daily_returns_twr(nav, flows)
+
+    sp = get_sp500_daily(year_start, today_key)
+
+    # Align on common dates
+    merged = (
+        port_daily.rename(columns={"r_port": "r_port"})
+        .merge(sp[["date", "daily_ret"]].rename(columns={"daily_ret": "r_bench"}), on="date", how="inner")
+    )
+
+    # Cumulative returns YTD
+    ytd_port = cumulative_return(merged.rename(columns={"r_port": "r_port"}), year_start, today_key)
+    ytd_bench = float((1 + merged["r_bench"].dropna()).prod() - 1) if not merged.empty else float("nan")
+
+    if pd.notna(ytd_port) and pd.notna(ytd_bench):
+        st.sidebar.caption(f"YTD (backend): Portfolio {ytd_port:.2%} vs S&P {ytd_bench:.2%}")
+except Exception as e:
+    st.sidebar.info(f"Perf debug unavailable: {e}")
