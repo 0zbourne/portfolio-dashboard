@@ -1,10 +1,14 @@
-import json, pandas as pd, streamlit as st
+# stdlib
+import json
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
 
+# third-party
+import numpy as np
+import pandas as pd
 import requests
-from datetime import datetime, timedelta
-
-import os
+import streamlit as st
 
 # --- Fetch helper to refresh local JSONs from T212 API ---
 def fetch_to_file(url: str, out_path: Path):
@@ -82,6 +86,7 @@ def ensure_today_open_prices(df):
     _save_open_prices(store)
     return store, today
 
+# Portfolio loader
 @st.cache_data
 def load_portfolio(cache_bust: tuple):
     """
@@ -90,14 +95,32 @@ def load_portfolio(cache_bust: tuple):
     """
     with open(DATA, "r", encoding="utf-8") as f:
         items = json.load(f)
+
     df = pd.DataFrame(items)
 
-    # Minimal derived columns
-    df.rename(columns={"ticker":"symbol","quantity":"shares","currentPrice":"price_raw"}, inplace=True)
+    # Canonical column names
+    df.rename(
+        columns={
+            "ticker": "symbol",
+            "quantity": "shares",
+            "currentPrice": "price_raw",
+        },
+        inplace=True,
+    )
 
-    # Very rough GBP conversion for LSE tickers quoted in pence (GBX):
-    # If price looks huge (e.g., 14680 = 146.80 GBP), treat as pence.
-    df["price_gbp_guess"] = df["price_raw"].apply(lambda x: x/100 if x and x>1000 else x)
+    # ---- Strong dtype coercion (prevents '0', None, '' oddities)
+    df["shares"] = pd.to_numeric(df["shares"], errors="coerce").fillna(0).astype(int)
+    df["price_raw"] = pd.to_numeric(df["price_raw"], errors="coerce")
+
+    # ---- Safe GBX → GBP guess (vectorised, NaN-safe)
+    # Treat values > 1000 as pence (e.g., 14680 → £146.80)
+    df["price_gbp_guess"] = np.where(
+        (df["price_raw"].notna()) & (df["price_raw"] > 1000),
+        df["price_raw"] / 100.0,
+        df["price_raw"],
+    )
+
+    # Simple MV using the guessed GBP (used only as a rough placeholder)
     df["market_value_gbp_guess"] = df["shares"] * df["price_gbp_guess"]
 
     return df
@@ -379,29 +402,32 @@ df["avg_cost_raw"] = pd.to_numeric(df[avg_candidates[0]], errors="coerce") if av
 
 # 2) Listing currency from symbol
 def _ccy(sym: str) -> str:
+    """Infer listing ccy from T212 symbol convention."""
     return "USD" if "_US_" in str(sym) else "GBP"
 df["ccy"] = df["symbol"].apply(_ccy)
 
 # 3) Native price & native avg cost (no FX)
+# Ensure avg cost is numeric
+df["avg_cost_raw"] = pd.to_numeric(df["avg_cost_raw"], errors="coerce")
+
 def _price_native(row):
     p = row["price_raw"]
-    if p is None or pd.isna(p):
-        return None
-    p = float(p)
+    if pd.isna(p):
+        return np.nan
     if row["ccy"] == "USD":
-        return p                   # already USD
-    return p/100.0 if p > 1000 else p   # GBX → GBP for UK listings
+        return float(p)  # USD already native
+    # LSE pence → GBP if huge
+    return float(p) / 100.0 if p > 1000 else float(p)
 
 def _avg_native(row):
     x = row["avg_cost_raw"]
-    if x is None or pd.isna(x):
-        return None
-    x = float(x)
+    if pd.isna(x):
+        return np.nan
     if row["ccy"] == "USD":
-        return x                   # keep USD; do NOT guess FX
-    return x/100.0 if x > 1000 else x   # GBX → GBP for UK listings
+        return float(x)
+    return float(x) / 100.0 if x > 1000 else float(x)
 
-df["price_native"]    = df.apply(_price_native, axis=1)
+df["price_native"] = df.apply(_price_native, axis=1)
 df["avg_cost_native"] = df.apply(_avg_native, axis=1)
 
 # ---- Allow manual mapping of "Day Change" fields if present in payload ----
@@ -454,9 +480,13 @@ else:
     df["cost_basis_gbp"] = None
 
 # --- Portfolio value in GBP (already computed earlier) ---
-df["total_value_gbp"] = df["market_value_gbp"]
-portfolio_total = df["total_value_gbp"].sum()
-df["weight_pct"] = (df["total_value_gbp"] / portfolio_total) * 100
+df["total_value_gbp"] = pd.to_numeric(df["market_value_gbp"], errors="coerce")
+portfolio_total = float(df["total_value_gbp"].sum())
+df["weight_pct"] = np.where(
+    portfolio_total > 0,
+    (df["total_value_gbp"] / portfolio_total) * 100.0,
+    0.0,
+)
 
 # --- Day change calculation ---
 # Strategy:
@@ -527,26 +557,43 @@ if 'sel_abs' in locals() and sel_abs != "<auto>" and sel_abs in df.columns:
 if 'sel_pct' in locals() and sel_pct != "<auto>" and sel_pct in df.columns:
     df["day_change_pct"] = pd.to_numeric(df[sel_pct], errors="coerce")
 
+# --- Normalise day-change outputs (ensure numeric, fill NaN→0 for display)
+df["day_change_gbp"] = pd.to_numeric(df["day_change_gbp"], errors="coerce")
+df["day_change_pct"] = pd.to_numeric(df["day_change_pct"], errors="coerce")
+
 def _gbp_from_native(row, x):
     if pd.isna(x): 
         return float("nan")
     return float(x) * (usd_to_gbp if row["ccy"] == "USD" else 1.0)
 
 # 8) Capital gains (GBP) & total return (GBP / %)
-# Preferred: true GBP cost from transactions.json (already GBP)
+# Ensure true_avg_cost_gbp & dividends_gbp are numeric
+df["true_avg_cost_gbp"] = pd.to_numeric(df["true_avg_cost_gbp"], errors="coerce")
+df["dividends_gbp"] = pd.to_numeric(df["dividends_gbp"], errors="coerce")
+
+# True cost (GBP) from transactions when available
 df["cost_basis_gbp"] = df["shares"] * df["true_avg_cost_gbp"]
 
-# Fallback: approximate cost from avg_cost_native (FX-adjust USD rows)
+# Fallback: FX-adjusted native average
 approx_cost_each_gbp = df.apply(lambda r: _gbp_from_native(r, r["avg_cost_native"]), axis=1)
 df["cost_basis_gbp_approx"] = df["shares"] * approx_cost_each_gbp
 
-# Use true when available; otherwise approx
+# Prefer true; else approx
 df["cost_basis_gbp_effective"] = df["cost_basis_gbp"].combine_first(df["cost_basis_gbp_approx"])
 
-# Gains & returns
-df["capital_gains_gbp"] = df["total_value_gbp"] - df["cost_basis_gbp_effective"]
-df["total_return_gbp"]  = df["capital_gains_gbp"] + df["dividends_gbp"]
-df["total_return_pct"]  = (df["total_return_gbp"] / df["cost_basis_gbp_effective"]) * 100
+# Gains / returns (numeric & safe)
+df["capital_gains_gbp"] = pd.to_numeric(df["total_value_gbp"], errors="coerce") - pd.to_numeric(
+    df["cost_basis_gbp_effective"], errors="coerce"
+)
+
+df["total_return_gbp"] = df["capital_gains_gbp"] + df["dividends_gbp"].fillna(0)
+
+den = df["cost_basis_gbp_effective"]
+df["total_return_pct"] = np.where(
+    (den.notna()) & (den != 0),
+    (df["total_return_gbp"] / den) * 100.0,
+    np.nan,
+)
 
 # 9) Native P/L % (price vs avg in native currency, FX-free)
 df["pl_pct_native"] = (
@@ -554,6 +601,24 @@ df["pl_pct_native"] = (
 )
 
 # 10) Build the display table
+
+# Clean display numerics (ensures formatting works uniformly)
+num_cols = [
+    "price_native",
+    "avg_cost_native",
+    "day_change_gbp",
+    "day_change_pct",
+    "total_return_gbp",
+    "total_return_pct",
+    "dividends_gbp",
+    "capital_gains_gbp",
+    "total_value_gbp",
+    "weight_pct",
+]
+for c in num_cols:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
 view = df[[
     "company",
     "shares",
