@@ -74,6 +74,11 @@ for p in [Path("data/portfolio.json"), Path("data/transactions.json"), Path("dat
 # Now load from disk as before
 df = load_portfolio()
 
+# --- DEBUG: show columns & a few rows so we can see what T212 returns
+with st.sidebar.expander("Debug: portfolio columns", expanded=False):
+    st.write(sorted(df.columns.tolist()))
+    st.write(df.head(3))
+
 # ---- Company / Instrument name (best effort, with optional instruments.json) ----
 name_like_cols = [
     "name", "instrument.name", "displayName", "display_name",
@@ -337,6 +342,35 @@ def _avg_native(row):
 df["price_native"]    = df.apply(_price_native, axis=1)
 df["avg_cost_native"] = df.apply(_avg_native, axis=1)
 
+# ---- Allow manual mapping of "Day Change" fields if present in payload ----
+def _find_candidates(cols, must_have_any, also_any=None):
+    out = []
+    low = {c: c.lower() for c in cols}
+    for c, lc in low.items():
+        if any(tok in lc for tok in must_have_any) and (not also_any or any(tok in lc for tok in also_any)):
+            out.append(c)
+    return out
+
+day_abs_candidates = (
+    _find_candidates(df.columns, ["day", "today"], ["pnl", "pl", "change", "chg", "diff", "return"])
+    + _find_candidates(df.columns, ["change"], ["day", "today"])
+)
+
+day_pct_candidates = (
+    _find_candidates(df.columns, ["day", "today"], ["pct", "percent", "%", "return"])
+    + _find_candidates(df.columns, ["changepct", "percent", "%"])
+)
+
+with st.sidebar.expander("Map day-change fields", expanded=False):
+    sel_abs = st.selectbox(
+        "Day Change £ column (per-share OR position)",
+        options=["<auto>"] + day_abs_candidates, index=0
+    )
+    sel_pct = st.selectbox(
+        "Day Change % column",
+        options=["<auto>"] + day_pct_candidates, index=0
+    )
+
 # --- Dividends per ticker (GBP) ---
 div_tbl, _div_err = load_dividends_t212(Path("data") / "dividends.json")
 if _div_err is None and div_tbl is not None:
@@ -390,6 +424,29 @@ if prev_col:
     )
     # % day change
     df["day_change_pct"] = (df["price_native"] / df["prev_close_native"] - 1.0) * 100
+
+# --- Manual mapping (sidebar) overrides if user selected columns ---
+if 'sel_abs' in locals() and sel_abs != "<auto>" and sel_abs in df.columns:
+    tmp_abs = pd.to_numeric(df[sel_abs], errors="coerce")
+
+    # Heuristic: decide if the chosen column is per-share or already position-level.
+    # If the median absolute change is small relative to the share price, treat as per-share.
+    try:
+        med_price = pd.to_numeric(df["price_native"], errors="coerce").median()
+        med_abs   = tmp_abs.abs().median()
+        per_share = bool(med_price and med_abs and med_abs < (3 * med_price))
+    except Exception:
+        per_share = False
+
+    def _to_gbp(row, val):
+        if pd.isna(val): return float("nan")
+        scaled = (val * row["shares"]) if per_share else val
+        return float(scaled) * (usd_to_gbp if row["ccy"] == "USD" else 1.0)
+
+    df["day_change_gbp"] = df.apply(lambda r: _to_gbp(r, tmp_abs.loc[r.name]), axis=1)
+
+if 'sel_pct' in locals() and sel_pct != "<auto>" and sel_pct in df.columns:
+    df["day_change_pct"] = pd.to_numeric(df[sel_pct], errors="coerce")
 
 # ---- Fallbacks if the API didn't give us a previous close ----
 def _pick(colnames, must_have_any, also_any=None):
@@ -488,7 +545,7 @@ notes = []
 if df["true_avg_cost_gbp"].isna().any():
     notes.append("Using **approximate cost basis** from average price for some rows (FX-adjusted). Upload transactions.json for true GBP cost.")
 if df["day_change_gbp"].isna().all():
-    notes.append("Could not find day-change fields in the payload; columns show ‘—’.")
+    notes.append("Day change not found. Use the **Map day-change fields** panel in the sidebar to bind your API fields.")
 if notes:
     st.caption(" • ".join(notes))
 
