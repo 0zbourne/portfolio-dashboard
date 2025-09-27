@@ -33,6 +33,42 @@ st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
 DATA = Path("data") / "portfolio.json"
 
+# --- Persist & read "opening price for the day" so we can compute day change ---
+OPEN_FILE = Path("data") / "open_prices.json"
+
+def _load_open_prices():
+    if OPEN_FILE.exists():
+        try:
+            return json.loads(OPEN_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+def _save_open_prices(dct):
+    OPEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OPEN_FILE.write_text(json.dumps(dct, indent=2), encoding="utf-8")
+
+def ensure_today_open_prices(df):
+    """
+    Ensure we have an 'open price' for each symbol for today's date.
+    If missing, use current price_native as the 'open' anchor.
+    Returns (store_dict, today_key).
+    """
+    today = datetime.utcnow().date().isoformat()  # change to local date if you prefer
+    store = _load_open_prices()
+    day_bucket = store.get(today, {})
+
+    # If we don't yet have an opening price for a symbol, record it now.
+    for _, row in df.iterrows():
+        sym = str(row["symbol"])
+        p = row.get("price_native")
+        if pd.notna(p) and sym not in day_bucket:
+            day_bucket[sym] = float(p)
+
+    store[today] = day_bucket
+    _save_open_prices(store)
+    return store, today
+
 @st.cache_data
 def load_portfolio():
     with open(DATA, "r", encoding="utf-8") as f:
@@ -232,6 +268,14 @@ else:
     else:
         usd_to_gbp = auto_rate
 
+with st.sidebar.expander("Day change settings", expanded=False):
+    if st.button("Reset today’s open prices"):
+        # wipe only today's bucket
+        _store = _load_open_prices()
+        _store[datetime.utcnow().date().isoformat()] = {}
+        _save_open_prices(_store)
+        st.success("Today's open prices reset. Reload to re-anchor.")
+
 # Convert to GBP:
 # - London listings in pence (GBX) already handled earlier (price_gbp_guess).
 # - US listings are marked by "_US_" in the T212 symbol (e.g., GOOGL_US_EQ, MA_US_EQ).
@@ -396,7 +440,12 @@ df["total_value_gbp"] = df["market_value_gbp"]
 portfolio_total = df["total_value_gbp"].sum()
 df["weight_pct"] = (df["total_value_gbp"] / portfolio_total) * 100
 
-# --- Day change (try prev close first; then wide-net fallbacks) ---
+# --- Day change calculation ---
+# Strategy:
+# 1) If API provides a previous close column, use it (native).
+# 2) Else, use persisted "today open" prices captured on first run of the day.
+# 3) Optional manual mapping (sidebar) can override.
+
 _prev_close_candidates = [
     "previousClose","prevClose","lastClose","closePrevious",
     "pricePrevClose","previous_close","priorClose"
@@ -407,30 +456,42 @@ df["day_change_gbp"] = float("nan")
 df["day_change_pct"] = float("nan")
 
 if prev_col:
+    # API-driven day change (native)
     def _prev_native(row):
         v = row[prev_col]
         if v is None or pd.isna(v): return None
         v = float(v)
         return v if row["ccy"] == "USD" else (v / 100.0 if v > 1000 else v)
-
     df["prev_close_native"] = df.apply(_prev_native, axis=1)
     df["day_change_native"] = df["price_native"] - df["prev_close_native"]
+else:
+    # Persisted "today open" prices (native)
+    store, today_key = ensure_today_open_prices(df)
+    today_opens = store.get(today_key, {})
+    def _open_native(row):
+        p = today_opens.get(str(row["symbol"]))
+        return float(p) if p is not None else float("nan")
+    df["prev_close_native"] = df.apply(_open_native, axis=1)  # reuse column name
+    df["day_change_native"] = df["price_native"] - df["prev_close_native"]
 
-    # absolute £ day change
-    df["day_change_gbp"] = df.apply(
-        lambda r: r["shares"] * (r["day_change_native"] * (usd_to_gbp if r["ccy"] == "USD" else 1.0))
-        if pd.notna(r["day_change_native"]) else float("nan"),
-        axis=1
-    )
-    # % day change
-    df["day_change_pct"] = (df["price_native"] / df["prev_close_native"] - 1.0) * 100
+# Absolute £ day change (convert USD rows with FX and scale by shares)
+def _native_to_gbp(row, v):
+    if pd.isna(v): return float("nan")
+    return float(v) * (usd_to_gbp if row["ccy"] == "USD" else 1.0)
 
-# --- Manual mapping (sidebar) overrides if user selected columns ---
+df["day_change_gbp"] = df.apply(
+    lambda r: r["shares"] * _native_to_gbp(r, r["day_change_native"]),
+    axis=1
+)
+
+# % day change (native %, independent of FX)
+df["day_change_pct"] = (df["price_native"] / df["prev_close_native"] - 1.0) * 100
+
+# ---- Manual mapping (sidebar) overrides if user selected columns ----
 if 'sel_abs' in locals() and sel_abs != "<auto>" and sel_abs in df.columns:
     tmp_abs = pd.to_numeric(df[sel_abs], errors="coerce")
 
-    # Heuristic: decide if the chosen column is per-share or already position-level.
-    # If the median absolute change is small relative to the share price, treat as per-share.
+    # Heuristic: detect per-share vs position-level
     try:
         med_price = pd.to_numeric(df["price_native"], errors="coerce").median()
         med_abs   = tmp_abs.abs().median()
@@ -447,34 +508,6 @@ if 'sel_abs' in locals() and sel_abs != "<auto>" and sel_abs in df.columns:
 
 if 'sel_pct' in locals() and sel_pct != "<auto>" and sel_pct in df.columns:
     df["day_change_pct"] = pd.to_numeric(df[sel_pct], errors="coerce")
-
-# ---- Fallbacks if the API didn't give us a previous close ----
-def _pick(colnames, must_have_any, also_any=None):
-    """Pick first column whose name contains ALL tokens in `must_have_any`
-       and (if provided) ANY token in `also_any` (case-insensitive)."""
-    low = {c: c.lower() for c in colnames}
-    for c, lc in low.items():
-        if all(tok in lc for tok in must_have_any) and (not also_any or any(tok in lc for tok in also_any)):
-            return c
-    return None
-
-if df["day_change_gbp"].isna().all():
-    # absolute “today/day” PnL or change
-    abs_col = _pick(df.columns, ["day"], ["pnl","pl","change","chg","diff","ret"]) \
-          or  _pick(df.columns, ["today"], ["pnl","pl","change","chg","diff","ret"])
-    if abs_col:
-        vals = pd.to_numeric(df[abs_col], errors="coerce")
-        df["day_change_gbp"] = df.apply(
-            lambda r: (vals.loc[r.name] * (usd_to_gbp if r["ccy"] == "USD" else 1.0))
-            if pd.notna(vals.loc[r.name]) else float("nan"),
-            axis=1
-        )
-
-    # percentage “today/day”
-    pct_col = _pick(df.columns, ["day"],   ["pct","percent","%","ret"]) \
-          or  _pick(df.columns, ["today"], ["pct","percent","%","ret"])
-    if pct_col:
-        df["day_change_pct"] = pd.to_numeric(df[pct_col], errors="coerce")
 
 def _gbp_from_native(row, x):
     if pd.isna(x): 
@@ -545,7 +578,7 @@ notes = []
 if df["true_avg_cost_gbp"].isna().any():
     notes.append("Using **approximate cost basis** from average price for some rows (FX-adjusted). Upload transactions.json for true GBP cost.")
 if df["day_change_gbp"].isna().all():
-    notes.append("Day change not found. Use the **Map day-change fields** panel in the sidebar to bind your API fields.")
+    notes.append("Day change anchored to today’s first seen price (or map fields in the sidebar if your API provides them).")
 if notes:
     st.caption(" • ".join(notes))
 
