@@ -208,6 +208,7 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
 # Public function
 # ---------------------------
 def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) -> Path:
+    os.environ["NAV_AUDIT"] = "1"   # TEMP: force audit dump on
     """
     Build daily NAV (GBP) into data/nav_daily.csv using orders history and yfinance.
     Also writes data/backfill_report.json with any missing symbols.
