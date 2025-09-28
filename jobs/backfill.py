@@ -259,16 +259,33 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
                             errors="coerce", utc=True)
     w["filledAt"] = dt.dt.date
 
-    # Determine BUY/SELL side:
-    # 1) Prefer explicit 'fillType' if present; 2) else infer from filledValue sign; 3) default BUY.
+    # Determine BUY/SELL side robustly:
+    # 1) If fillType starts with SELL/BUY (e.g. SELL_LIMIT, BUY_MARKET), use that.
+    # 2) Else use the sign of filledValue (negative => SELL).
+    # 3) Else use sign of orderedValue.
+    # 4) Else default BUY.
+    side_from_ft = pd.Series(index=o.index, dtype="object")
     if "fillType" in o.columns:
-        side = o["fillType"].astype(str).str.upper()
-        w["side"] = side.where(side.isin(["BUY", "SELL"]), "BUY")
-    elif "filledValue" in o.columns:
-        vals = pd.to_numeric(o["filledValue"], errors="coerce").fillna(0.0)
-        w["side"] = ["SELL" if v < 0 else "BUY" for v in vals]
-    else:
-        w["side"] = "BUY"
+        ft = o["fillType"].astype(str).str.upper()
+        side_from_ft = np.where(ft.str.startswith("SELL"), "SELL",
+                         np.where(ft.str.startswith("BUY"),  "BUY",  np.nan))
+        side_from_ft = pd.Series(side_from_ft, index=o.index)
+
+    side_from_val = pd.Series(index=o.index, dtype="object")
+    if "filledValue" in o.columns:
+        fv = pd.to_numeric(o["filledValue"], errors="coerce")
+        side_from_val = np.where(fv < 0, "SELL", np.where(fv >= 0, "BUY", np.nan))
+        side_from_val = pd.Series(side_from_val, index=o.index)
+
+    side_from_ov = pd.Series(index=o.index, dtype="object")
+    if "orderedValue" in o.columns:
+        ov = pd.to_numeric(o["orderedValue"], errors="coerce")
+        side_from_ov = np.where(ov < 0, "SELL", np.where(ov >= 0, "BUY", np.nan))
+        side_from_ov = pd.Series(side_from_ov, index=o.index)
+
+    # Priority: fillType -> filledValue sign -> orderedValue sign -> BUY
+    side_final = side_from_ft.fillna(side_from_val).fillna(side_from_ov).fillna("BUY")
+    w["side"] = side_final
 
     # Build the daily position matrix
     pos = _build_position_timeseries(w[["ticker", "side", "filledQuantity", "filledAt"]], d0, d1)
@@ -283,33 +300,40 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
     # 3) Prices (GBP)
     prices, miss = _download_prices(mapping, d0, d1)
 
+    # AUDIT: write per-ticker daily values/positions when NAV_AUDIT=1
+    if os.getenv("NAV_AUDIT") == "1":
+        (pos * prices).to_csv(DATA_DIR / "nav_contrib_by_ticker.csv")
+        pos.to_csv(DATA_DIR / "positions_debug.csv")
+        w.to_csv(DATA_DIR / "orders_debug.csv", index=False)
+
     # Only keep tickers with prices
     keep = [t for t in pos.columns if t in prices.columns]
     pos = pos[keep]
     prices = prices[keep]
 
-    # 4) NAV per day — carry forward last close over non-trading days
+       # 4) NAV per day — carry forward last close over non-trading days
     # Ensure a full calendar index and forward-fill prices/positions
     full_idx = pd.date_range(d0, d1, freq="D").date
 
-    prices = prices.sort_index()
-    prices = prices.reindex(full_idx).ffill()
+    # Reindex and ffill
+    prices = prices.sort_index().reindex(full_idx).ffill()
+    pos    = pos.sort_index().reindex(full_idx).ffill().fillna(0.0)
 
-    pos = pos.sort_index()
-    pos = pos.reindex(full_idx).ffill().fillna(0.0)
+    # SAFEGUARD: force all cells to be numeric floats (avoid StrDType vs Float errors)
+    prices = prices.apply(pd.to_numeric, errors="coerce").astype("float64")
+    pos    = pos.apply(pd.to_numeric,    errors="coerce").fillna(0.0).astype("float64")
 
     # Compute NAV and clean
-    nav = (pos * prices).sum(axis=1)
-    nav = pd.to_numeric(nav, errors="coerce").replace([np.inf, -np.inf], np.nan).ffill()
+    nav_vals = (pos * prices).sum(axis=1)
+    nav_vals = pd.to_numeric(nav_vals, errors="coerce").replace([np.inf, -np.inf], np.nan).ffill()
 
     # Save as CSV (date, nav_gbp)
     nav = pd.DataFrame({
         "date": pd.to_datetime(full_idx).strftime("%Y-%m-%d"),
-        "nav_gbp": nav.values
+        "nav_gbp": nav_vals.values
     })
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     nav.to_csv(NAV_CSV, index=False)
-
 
     # 5) Report
     REPORT.write_text(json.dumps({"missing_symbols": miss, "mapped": mapping}, indent=2), encoding="utf-8")
