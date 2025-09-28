@@ -275,18 +275,21 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
     side_from_val = pd.Series(index=o.index, dtype="object")
     if "filledValue" in o.columns:
         fv = pd.to_numeric(o["filledValue"], errors="coerce")
-        side_from_val = np.where(fv < 0, "SELL", np.where(fv >= 0, "BUY", np.nan))
+        side_from_val = np.where(fv > 0, "SELL", np.where(fv < 0, "BUY", np.nan))
         side_from_val = pd.Series(side_from_val, index=o.index)
 
     side_from_ov = pd.Series(index=o.index, dtype="object")
     if "orderedValue" in o.columns:
         ov = pd.to_numeric(o["orderedValue"], errors="coerce")
-        side_from_ov = np.where(ov < 0, "SELL", np.where(ov >= 0, "BUY", np.nan))
+        side_from_ov  = np.where(ov > 0, "SELL", np.where(ov < 0, "BUY", np.nan))
         side_from_ov = pd.Series(side_from_ov, index=o.index)
 
     # Priority: fillType -> filledValue sign -> orderedValue sign -> BUY
     side_final = side_from_ft.fillna(side_from_val).fillna(side_from_ov).fillna("BUY")
     w["side"] = side_final
+
+    # After: w["side"] = side_final
+    w.loc[w["side"].isna(), "side"] = "BUY"
 
     # Build the daily position matrix
     pos = _build_position_timeseries(w[["ticker", "side", "filledQuantity", "filledAt"]], d0, d1)
