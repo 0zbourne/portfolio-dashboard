@@ -1,4 +1,5 @@
 # perf/series.py
+
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -35,21 +36,27 @@ def read_nav(path: Path = NAV_CSV) -> pd.Series:
 def daily_returns_twr(nav: pd.Series, flows: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Time-weighted daily returns with external cash flows.
-    Formula (for day t): r_t = NAV_t / (NAV_{t-1} + flow_t) - 1
-    where flow_t is cash added(+) or withdrawn(−) **during** day t before close.
-    Returns a DataFrame with columns: date, r_port.
+    Robust to leading zeros/NaNs in NAV so we don't produce infs.
+    r_t = NAV_t / (NAV_{t-1} + flow_t) - 1
     """
+    # Guard: empty
     if nav is None or len(nav) == 0:
         return pd.DataFrame(columns=["date", "r_port"])
 
-    # clean & sort
-    nav = pd.to_numeric(nav, errors="coerce").dropna().sort_index()
-    nav.name = "nav"
+    # Clean & sort
+    nav = pd.to_numeric(nav, errors="coerce").sort_index()
+    # Treat non-positive NAV as missing (cannot compute a return against 0)
+    nav = nav.where(nav > 0)
 
-    # flows → series indexed by date (same freq), default 0
+    # Trim off leading NaNs/zeros so the series starts on the first valid NAV
+    first_idx = nav.first_valid_index()
+    if first_idx is None:
+        return pd.DataFrame(columns=["date", "r_port"])
+    nav = nav.loc[first_idx:]
+
+    # ---- Flows (optional) ----
     if flows is not None and not flows.empty:
         f = flows.copy()
-        # tolerate date as str/date/datetime
         f["date"] = pd.to_datetime(f["date"], errors="coerce")
         f = f.dropna(subset=["date"])
         f["amount_gbp"] = pd.to_numeric(f["amount_gbp"], errors="coerce")
@@ -57,14 +64,23 @@ def daily_returns_twr(nav: pd.Series, flows: pd.DataFrame | None = None) -> pd.D
     else:
         flow_s = pd.Series(dtype="float64")
 
-    # align on nav dates
+    # Align flows to nav index
     flow_s = flow_s.reindex(nav.index, fill_value=0.0)
 
+    # Denominator: previous NAV + same-day flow
     denom = nav.shift(1) + flow_s
+
+    # Compute daily return; invalid denoms produce NaN (not inf)
     r = nav / denom - 1.0
-    # first day has no denom — set to 0 for continuity
-    r.iloc[0] = 0.0
-    out = pd.DataFrame({"date": nav.index, "r_port": r.values})
+
+    # First day has no denominator: set to 0.0 for continuity
+    if len(r) > 0:
+        r.iloc[0] = 0.0
+
+    # Drop non-finite values
+    r = r.replace([np.inf, -np.inf], np.nan).dropna()
+
+    out = pd.DataFrame({"date": r.index, "r_port": r.values})
     return out
 
 def cumulative_return(obj, start: str | None = None, end: str | None = None) -> float:
@@ -75,20 +91,24 @@ def cumulative_return(obj, start: str | None = None, end: str | None = None) -> 
     Applies date filtering if start/end provided.
     """
     if isinstance(obj, pd.DataFrame):
-        if "date" in obj.columns:
-            df = obj.copy()
+        df = obj.copy()
+        if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            if start: df = df[df["date"] >= pd.to_datetime(start)]
-            if end:   df = df[df["date"] <= pd.to_datetime(end)]
-            s = pd.to_numeric(df["r_port"], errors="coerce").dropna()
+            if start:
+                df = df[df["date"] >= pd.to_datetime(start)]
+            if end:
+                df = df[df["date"] <= pd.to_datetime(end)]
+            s = pd.to_numeric(df["r_port"], errors="coerce")
         else:
-            # fallback to first numeric column
-            s = pd.to_numeric(obj.select_dtypes(include=[np.number]).iloc[:, 0], errors="coerce").dropna()
+            s = pd.to_numeric(df.select_dtypes(include=[np.number]).iloc[:, 0], errors="coerce")
     else:
-        s = pd.to_numeric(pd.Series(obj), errors="coerce").dropna()
+        s = pd.to_numeric(pd.Series(obj), errors="coerce")
 
+    # Keep only finite values
+    s = s.replace([np.inf, -np.inf], np.nan).dropna()
     if s.empty:
         return np.nan
+
     return float((1.0 + s).prod() - 1.0)
 
 def cagr(returns: pd.Series | pd.DataFrame, periods_per_year: int = 252) -> float:

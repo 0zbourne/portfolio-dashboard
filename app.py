@@ -698,6 +698,28 @@ else:
     st.bar_chart(monthly, x="year_month", y="amount_gbp", use_container_width=True)
     st.caption("Monthly dividend cash received (GBP).")
 
+# -----------------------
+# One-off NAV backfill UI
+# -----------------------
+with st.sidebar.expander("Backfill NAV (since 2025-01-01)", expanded=False):
+    st.write("Rebuild daily NAV in GBP from **orders** + yfinance prices. Optional overrides: data/ticker_overrides.json")
+    start_str = st.text_input("Start date", value="2025-01-01")
+    if st.button("Run NAV backfill"):
+        try:
+            from jobs.backfill import backfill_nav_from_orders
+            out_path = backfill_nav_from_orders(start=start_str)
+            st.success(f"NAV backfill complete → {out_path}")
+            rep_path = Path("data") / "backfill_report.json"
+            if rep_path.exists():
+                rep = json.loads(rep_path.read_text(encoding="utf-8"))
+                missing = rep.get("missing_symbols", [])
+                if missing:
+                    st.warning(f"No price history for: {', '.join(missing)}. Add mappings in data/ticker_overrides.json.")
+                else:
+                    st.caption("All symbols fetched successfully.")
+        except Exception as e:
+            st.error(f"NAV backfill failed: {e}")
+
 # =======================
 # Backend performance plumbing (no UI yet)
 # =======================
