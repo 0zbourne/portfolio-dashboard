@@ -149,58 +149,74 @@ def _download_fx_usd_gbp(start: date, end: date) -> pd.Series:
 
 def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) -> tuple[pd.DataFrame, list[str]]:
     """
-    yf_map: {t212_ticker: (yf_symbol, ccy)}
-    Returns: (prices_gbp_by_date_ticker, missing_list)
+    Returns GBP prices: index = calendar dates, columns = original T212 tickers.
+    Enforces float64 at every step and never multiplies pandas objects that could
+    carry strings.
     """
-    missing = []
-    idx = pd.date_range(start, end, freq="D").date
-    out = pd.DataFrame(index=idx)
+    missing: list[str] = []
+    cal_idx = pd.date_range(start, end, freq="D").date
+    out = pd.DataFrame(index=cal_idx)  # empty; we'll add verified float64 columns
 
     if yf is None:
         raise RuntimeError("yfinance is not installed. Add it to requirements and pip install.")
 
-    # Build lists by ccy for efficiency
-    gbp_syms = [s for s,(y,ccy) in yf_map.items() if y and ccy=="GBP"]
-    usd_syms = [s for s,(y,ccy) in yf_map.items() if y and ccy=="USD"]
+    gbp_syms = [t for t,(y,ccy) in yf_map.items() if y and ccy == "GBP"]
+    usd_syms = [t for t,(y,ccy) in yf_map.items() if y and ccy == "USD"]
 
-    # Download once per ccy
-    # Yahoo returns timezone-aware index; we coerce to date
-    def _dl(symbols):
-        if not symbols: return pd.DataFrame()
-        df = yf.download(symbols, start=str(start), end=str(end + timedelta(days=1)), interval="1d", auto_adjust=True, progress=False)["Close"]
+    def _dl(symbols: list[str]) -> pd.DataFrame:
+        if not symbols:
+            return pd.DataFrame()
+        ysyms = [yf_map[t][0] for t in symbols]
+        df = yf.download(
+            ysyms,
+            start=str(start),
+            end=str(end + timedelta(days=1)),
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+        )["Close"]
         if isinstance(df, pd.Series):
             df = df.to_frame()
         df.index = pd.to_datetime(df.index).date
-        return df
+        # coerce every column to float64 (strings -> NaN)
+        for c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+        return df.reindex(cal_idx)
+    # download by currency
+    gbp_px = _dl(gbp_syms)
+    usd_px = _dl(usd_syms)
 
-    gbp_px = _dl([yf_map[s][0] for s in gbp_syms])
-    usd_px = _dl([yf_map[s][0] for s in usd_syms])
-
-    # FX
+    # ECB USD->GBP
     fx = _download_fx_usd_gbp(start, end) if not usd_px.empty else pd.Series(dtype="float64")
+    fx = pd.to_numeric(fx, errors="coerce").astype("float64").reindex(cal_idx)
+    fx_np = fx.to_numpy(dtype=np.float64, na_value=np.nan) if not fx.empty else None
 
-    # Attach to out with original T212 tickers as columns
+    # ---- GBP listings (GBX->GBP heuristic) ----
     for t in gbp_syms:
         ysym = yf_map[t][0]
         ser = gbp_px.get(ysym)
         if ser is None or ser.dropna().empty:
-            missing.append(t)
-            continue
-        # LSE quotes are usually GBp; detect and convert to GBP if median is large
-        med = float(ser.dropna().median()) if ser.notna().any() else math.nan
+            missing.append(t); continue
+        med = float(ser.dropna().median()) if ser.notna().any() else np.nan
         if med and med > 1000:
             ser = ser / 100.0
-        out[t] = ser.reindex(out.index)
+        # final, guaranteed float64 column aligned to calendar
+        out[t] = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
 
-    for t in usd_syms:
-        ysym = yf_map[t][0]
-        ser = usd_px.get(ysym)
-        if ser is None or ser.dropna().empty:
-            missing.append(t)
-            continue
-        # Convert USD→GBP
-        ser = ser.reindex(out.index)
-        out[t] = ser * fx.reindex(out.index)
+    # ---- USD listings (NumPy multiply only) ----
+    if not usd_px.empty and fx_np is not None:
+        for t in usd_syms:
+            ysym = yf_map[t][0]
+            ser = usd_px.get(ysym)
+            if ser is None or ser.dropna().empty:
+                missing.append(t); continue
+            ser = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
+            ser_np = ser.to_numpy(dtype=np.float64, na_value=np.nan)
+            out[t] = pd.Series(ser_np * fx_np, index=cal_idx, dtype="float64")
+
+    # final safety: all cols float64
+    for c in out.columns:
+        out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
 
     return out, missing
 
@@ -208,7 +224,9 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
 # Public function
 # ---------------------------
 def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) -> Path:
-    os.environ["NAV_AUDIT"] = "1"   # TEMP: force audit dump on
+    Path("data/_backfill_called.txt").write_text(
+        f"called at {datetime.utcnow().isoformat()}Z\n", encoding="utf-8"
+    )
     """
     Build daily NAV (GBP) into data/nav_daily.csv using orders history and yfinance.
     Also writes data/backfill_report.json with any missing symbols.
@@ -304,40 +322,53 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
     # 3) Prices (GBP)
     prices, miss = _download_prices(mapping, d0, d1)
 
-    # AUDIT: write per-ticker daily values/positions when NAV_AUDIT=1
-    if os.getenv("NAV_AUDIT") == "1":
-        (pos * prices).to_csv(DATA_DIR / "nav_contrib_by_ticker.csv")
-        pos.to_csv(DATA_DIR / "positions_debug.csv")
-        w.to_csv(DATA_DIR / "orders_debug.csv", index=False)
-
-    # Only keep tickers with prices
+    # Keep only tickers that have prices
     keep = [t for t in pos.columns if t in prices.columns]
     pos = pos[keep]
     prices = prices[keep]
 
-       # 4) NAV per day — carry forward last close over non-trading days
-    # Ensure a full calendar index and forward-fill prices/positions
+    # Align to full calendar and forward-fill
     full_idx = pd.date_range(d0, d1, freq="D").date
-
-    # Reindex and ffill
     prices = prices.sort_index().reindex(full_idx).ffill()
     pos    = pos.sort_index().reindex(full_idx).ffill().fillna(0.0)
 
-    # SAFEGUARD: force all cells to be numeric floats (avoid StrDType vs Float errors)
-    prices = prices.apply(pd.to_numeric, errors="coerce").astype("float64")
-    pos    = pos.apply(pd.to_numeric,    errors="coerce").fillna(0.0).astype("float64")
+    # Force numeric (columns only; index stays as dates)
+    for df_name, df in (("prices", prices), ("pos", pos)):
+        for c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    # if anything is still string/object, capture it and stop with a readable message
+        bad = []
+        for c in df.columns:
+            if df[c].dtype.kind not in ("f", "i"):  # not float/int
+                bad.append(c)
+        if bad:
+            dbg = {
+                "frame": df_name,
+                "bad_columns": bad,
+                "sample": df[bad].head(5).astype(str).to_dict(orient="list"),
+            }
+            (DATA_DIR / "debug").mkdir(parents=True, exist_ok=True)
+            (DATA_DIR / "debug" / "dtype_fail.json").write_text(json.dumps(dbg, indent=2), encoding="utf-8")
+            raise RuntimeError(f"{df_name} contains non-numeric columns: {bad} (see data/debug/dtype_fail.json)")
 
-    # Compute NAV and clean
-    nav_vals = (pos * prices).sum(axis=1)
-    nav_vals = pd.to_numeric(nav_vals, errors="coerce").replace([np.inf, -np.inf], np.nan).ffill()
+    # Cast to contiguous float64 arrays (no pandas ops beyond this point)
+    pos_np    = pos.to_numpy(dtype=np.float64, na_value=np.nan)
+    prices_np = prices.to_numpy(dtype=np.float64, na_value=np.nan)
 
-    # Save as CSV (date, nav_gbp)
-    nav = pd.DataFrame({
-        "date": pd.to_datetime(full_idx).strftime("%Y-%m-%d"),
-        "nav_gbp": nav_vals.values
-    })
+    # Elementwise multiply, then row-sum (ignores NaN)
+    nav_vals = np.nansum(pos_np * prices_np, axis=1)
+    nav_vals = pd.Series(nav_vals, index=pd.Index(full_idx, name="date"), dtype="float64")
+
+    # Save CSV
+    nav = pd.DataFrame({"date": pd.to_datetime(full_idx).strftime("%Y-%m-%d"),
+                        "nav_gbp": nav_vals.values})
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     nav.to_csv(NAV_CSV, index=False)
+
+    REPORT.write_text(json.dumps({"missing_symbols": miss, "mapped": mapping}, indent=2),
+                      encoding="utf-8")
+    return NAV_CSV
+
 
     # 5) Report
     REPORT.write_text(json.dumps({"missing_symbols": miss, "mapped": mapping}, indent=2), encoding="utf-8")
