@@ -3,3 +3,5 @@ __pycache__/
 .env
 .streamlit/secrets.toml
 data/*.json
+"data/nav_daily.csv" 
+"data/_*.txt"        
