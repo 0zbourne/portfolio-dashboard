@@ -7,6 +7,16 @@ import pandas as pd
 import requests
 import numpy as np
 
+# --- Hard-disable Arrow & nullable dtypes so everything is NumPy-native ---
+try:
+    pd.options.mode.dtype_backend = "numpy"         # pandas >=2.1
+except Exception:
+    pass
+try:
+    pd.options.mode.string_storage = "python"       # avoid pyarrow-backed strings
+except Exception:
+    pass
+
 # Optional dependency; keep it local to this module
 try:
     import yfinance as yf
@@ -102,40 +112,38 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
     """
     orders columns expected: ['ticker','side','filledQuantity','filledAt'].
     side: BUY/SELL. filledQuantity positive numbers.
-    Returns DataFrame index=dates, columns=tickers, values=shares held.
+    Returns DataFrame index=dates, columns=tickers, values=shares held (float64).
     """
     if orders.empty:
-        return pd.DataFrame(index=pd.date_range(start, end, freq="D"))
+        idx = pd.date_range(start, end, freq="D").date
+        return pd.DataFrame(index=idx, dtype="float64")
 
-    # Normalize
     orders = orders.copy()
     orders["filledAt"] = pd.to_datetime(orders["filledAt"], errors="coerce", utc=True).dt.date
     orders = orders.dropna(subset=["filledAt", "ticker", "filledQuantity"])
-    orders["signed_qty"] = orders.apply(
-        lambda r: float(r["filledQuantity"]) * (1.0 if str(r.get("side","BUY")).upper().startswith("B") else -1.0),
-        axis=1
-    )
 
-    # Cumulate by day
-    daily_flows = (
-        orders.groupby(["filledAt","ticker"], as_index=False)["signed_qty"].sum()
-               .rename(columns={"filledAt":"date"})
-    )
+    # BUY = +qty, SELL = -qty
+    side_str = orders.get("side", "BUY").astype(str).str.upper()
+    sign = np.where(side_str.str.startswith("S"), -1.0, 1.0)
+    qty = pd.to_numeric(orders["filledQuantity"], errors="coerce").astype("float64")
+    orders["signed_qty"] = qty * sign
 
-    # Calendar index
+    daily = (orders.groupby(["filledAt", "ticker"], as_index=False)["signed_qty"]
+                    .sum().rename(columns={"filledAt": "date"}))
+
     idx = pd.date_range(start, end, freq="D").date
-    tickers = sorted(daily_flows["ticker"].unique().tolist())
-    mat = pd.DataFrame(0.0, index=idx, columns=tickers)
+    tickers = sorted(daily["ticker"].unique().tolist())
 
-    for _, row in daily_flows.iterrows():
-        d  = row["date"]
-        tk = row["ticker"]
-        q  = float(row["signed_qty"])
-        # Add from d onwards (position step)
+    # start as pure float64
+    mat = pd.DataFrame(0.0, index=idx, columns=tickers, dtype="float64")
+
+    # step function positions (holdings carry forward)
+    for _, r in daily.iterrows():
+        d = r["date"]; tk = r["ticker"]; q = float(r["signed_qty"])
         mat.loc[mat.index >= d, tk] += q
 
-    # Remove columns that are zero the whole time
-    mat = mat.loc[:, (mat != 0).any(axis=0)]
+    # drop all-zero columns and guarantee float64
+    mat = mat.loc[:, (mat != 0).any(axis=0)].astype("float64")
     return mat
 
 def _download_fx_usd_gbp(start: date, end: date) -> pd.Series:
@@ -155,7 +163,7 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
     """
     missing: list[str] = []
     cal_idx = pd.date_range(start, end, freq="D").date
-    out = pd.DataFrame(index=cal_idx)  # empty; we'll add verified float64 columns
+    out = pd.DataFrame(index=cal_idx, dtype="float64")
 
     if yf is None:
         raise RuntimeError("yfinance is not installed. Add it to requirements and pip install.")
@@ -220,157 +228,134 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
 
     return out, missing
 
-# ---------------------------
-# Public function
-# ---------------------------
 def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) -> Path:
-    Path("data/_backfill_called.txt").write_text(
-        f"called at {datetime.utcnow().isoformat()}Z\n", encoding="utf-8"
-    )
     """
-    Build daily NAV (GBP) into data/nav_daily.csv using orders history and yfinance.
-    Also writes data/backfill_report.json with any missing symbols.
+    Rebuild nav_daily.csv using Trading212 orders + yfinance prices.
+    On any failure, writes data/_backfill_trace.txt with the full traceback and any dtype info we reached.
     """
-    d0 = datetime.strptime(start, "%Y-%m-%d").date()
-    d1 = datetime.strptime(end,   "%Y-%m-%d").date() if end else datetime.utcnow().date()
+    # ---------- black-box crash logger ----------
+    import json, traceback
+    from datetime import datetime, timedelta
 
-    # 1) Pull ALL orders since the dawn of time, so positions are accurate at d0
-    fetch_from = "1970-01-01"   # or "2000-01-01" if you prefer
-    url = f"{API_BASE}/api/v0/equity/history/orders?from={fetch_from}&to={d1}"
-    items = _paged_get(url)
+    trace_path = DATA_DIR / "_backfill_trace.txt"
 
-    if not items:
-        raise RuntimeError("No order history returned from Trading212.")
+    def _dump_trace(stage: str, pos=None, prices=None):
+        try:
+            with open(trace_path, "w", encoding="utf-8") as f:
+                f.write(f"[STAGE] {stage}\n\n")
+                f.write("[TRACEBACK]\n")
+                f.write(traceback.format_exc())
+                f.write("\n")
+                if pos is not None:
+                    f.write("\n[positions.dtypes]\n")
+                    f.write(str(pos.dtypes) + "\n")
+                    bad = pos.select_dtypes(exclude=["float64"])
+                    if not bad.empty:
+                        f.write("non_float_positions: " + str(bad.columns.tolist()) + "\n")
+                if prices is not None:
+                    f.write("\n[prices.dtypes]\n")
+                    f.write(str(prices.dtypes) + "\n")
+                    bad = prices.select_dtypes(exclude=["float64"])
+                    if not bad.empty:
+                        f.write("non_float_prices: " + str(bad.columns.tolist()) + "\n")
+        except Exception as _e:  # don't let logging fail the run
+            print("[WARN] failed to write _backfill_trace.txt:", _e)
 
-    # Expect keys like: ticker, side, filledQuantity, filledAt (or placedAt/updatedAt)
-    o = pd.json_normalize(items)
-    # Keep only filled orders
-    if "status" in o.columns:
-        o = o[o["status"].astype(str).str.upper().eq("FILLED")]
+    # ---------- original logic (kept, but wrapped) ----------
+    try:
+        # marker so we know the button actually called us
+        (DATA_DIR / "_backfill_called.txt").write_text(
+            f"called at {datetime.utcnow().isoformat()}Z\n", encoding="utf-8"
+        )
 
-    # -----------------------------
-    # Standardize & prepare orders
-    # -----------------------------
-    # Your payload has dateModified/dateCreated; accept several names.
-    time_col = next(
-        (c for c in [
-            "filledAt", "updatedAt", "lastUpdated", "placedAt", "dateTime",
-            "dateModified", "dateCreated"
-        ] if c in o.columns),
-        None
-    )
-    if time_col is None:
-        raise RuntimeError(f"Could not find a fill timestamp column in orders. Columns: {list(o.columns)}")
+        # dates
+        d0 = datetime.strptime(start, "%Y-%m-%d").date()
+        d1 = datetime.strptime(end,   "%Y-%m-%d").date() if end else datetime.utcnow().date()
 
-    # We need: ticker, filledQuantity, timestamp → 'filledAt', and BUY/SELL side.
-    need_cols = ["ticker", "filledQuantity", time_col]
-    missing = [c for c in need_cols if c not in o.columns]
-    if missing:
-        raise RuntimeError(f"Orders payload missing columns: {missing}")
+        # 1) Orders from Trading212
+        fetch_from = "1970-01-01"
+        url = f"{API_BASE}/api/v0/equity/history/orders?from={fetch_from}&to={d1}"
+        items = _paged_get(url)
+        if not items:
+            raise RuntimeError("No order history returned from Trading212.")
 
-    w = o[need_cols].copy().rename(columns={time_col: "filledAt"})
+        o = pd.json_normalize(items)
+        if "status" in o.columns:
+            o = o[o["status"].astype(str).str.upper().eq("FILLED")]
 
-    # Coerce timestamp (strings or epoch-ms) → date
-    if pd.api.types.is_numeric_dtype(w["filledAt"]):
-        dt = pd.to_datetime(w["filledAt"], unit="ms", errors="coerce", utc=True)
-    else:
-        dt = pd.to_datetime(w["filledAt"].astype(str).str.replace("Z", "", regex=False),
-                            errors="coerce", utc=True)
-    w["filledAt"] = dt.dt.date
+        # pick a usable timestamp column
+        time_candidates = ["filledAt","updatedAt","lastUpdated","placedAt","dateTime","dateModified","dateCreated"]
+        time_col = next((c for c in time_candidates if c in o.columns), None)
+        if time_col is None:
+            raise RuntimeError(f"Could not find a fill timestamp column. Columns: {list(o.columns)}")
 
-    # Determine BUY/SELL side robustly:
-    # 1) If fillType starts with SELL/BUY (e.g. SELL_LIMIT, BUY_MARKET), use that.
-    # 2) Else use the sign of filledValue (negative => SELL).
-    # 3) Else use sign of orderedValue.
-    # 4) Else default BUY.
-    side_from_ft = pd.Series(index=o.index, dtype="object")
-    if "fillType" in o.columns:
-        ft = o["fillType"].astype(str).str.upper()
-        side_from_ft = np.where(ft.str.startswith("SELL"), "SELL",
-                         np.where(ft.str.startswith("BUY"),  "BUY",  np.nan))
-        side_from_ft = pd.Series(side_from_ft, index=o.index)
+        need_cols = ["ticker", "filledQuantity", time_col]
+        missing = [c for c in need_cols if c not in o.columns]
+        if missing:
+            raise RuntimeError(f"Orders payload missing columns: {missing}")
 
-    side_from_val = pd.Series(index=o.index, dtype="object")
-    if "filledValue" in o.columns:
-        fv = pd.to_numeric(o["filledValue"], errors="coerce")
-        side_from_val = np.where(fv > 0, "SELL", np.where(fv < 0, "BUY", np.nan))
-        side_from_val = pd.Series(side_from_val, index=o.index)
+        # unify ts -> filledAt (date)
+        w = o[need_cols].copy().rename(columns={time_col: "filledAt"})
+        if pd.api.types.is_numeric_dtype(w["filledAt"]):
+            dt = pd.to_datetime(w["filledAt"], unit="ms", errors="coerce", utc=True)
+        else:
+            dt = pd.to_datetime(w["filledAt"].astype(str), errors="coerce", utc=True)
+        w["filledAt"] = dt.dt.date
 
-    side_from_ov = pd.Series(index=o.index, dtype="object")
-    if "orderedValue" in o.columns:
-        ov = pd.to_numeric(o["orderedValue"], errors="coerce")
-        side_from_ov  = np.where(ov > 0, "SELL", np.where(ov < 0, "BUY", np.nan))
-        side_from_ov = pd.Series(side_from_ov, index=o.index)
+        # infer side if present; otherwise default BUY
+        side = o.get("side")
+        if side is None:
+            side = pd.Series("BUY", index=o.index)
+        w["side"] = side
 
-    # Priority: fillType -> filledValue sign -> orderedValue sign -> BUY
-    side_final = side_from_ft.fillna(side_from_val).fillna(side_from_ov).fillna("BUY")
-    w["side"] = side_final
+        # 2) Build positions timeseries (float64 matrix)
+        pos = _build_position_timeseries(w[["ticker","side","filledQuantity","filledAt"]], d0, d1)
 
-    # After: w["side"] = side_final
-    w.loc[w["side"].isna(), "side"] = "BUY"
+        # 3) Map tickers to yfinance & currencies (using your overrides)
+        overrides = _load_overrides()
+        mapping: dict[str, tuple[str,str]] = {}
+        for t in pos.columns:
+            ysym, ccy = _infer_yf_symbol(t, overrides)
+            mapping[t] = (ysym, ccy)
 
-    # Build the daily position matrix
-    pos = _build_position_timeseries(w[["ticker", "side", "filledQuantity", "filledAt"]], d0, d1)
+        # 4) Download prices (GBP/GBp normalized, USD->GBP converted)
+        prices, miss = _download_prices(mapping, d0, d1)
 
-    # 2) Map tickers → Yahoo symbols
-    overrides = _load_overrides()
-    mapping = {}
-    for t in pos.columns:
-        ysym, ccy = _infer_yf_symbol(t, overrides)
-        mapping[t] = (ysym, ccy)
+        # align columns present on both sides
+        keep = [t for t in pos.columns if t in prices.columns]
+        if not keep:
+            raise RuntimeError("No overlapping tickers between positions and prices.")
+        pos = pos[keep]
+        prices = prices[keep]
 
-    # 3) Prices (GBP)
-    prices, miss = _download_prices(mapping, d0, d1)
+        # 5) Align to full calendar and ffill; hard-cast float64
+        full_idx = pd.date_range(d0, d1, freq="D").date
+        prices = (prices.sort_index().reindex(full_idx).ffill().astype("float64"))
+        pos    = (pos.sort_index().reindex(full_idx).ffill().fillna(0.0).astype("float64"))
 
-    # Keep only tickers that have prices
-    keep = [t for t in pos.columns if t in prices.columns]
-    pos = pos[keep]
-    prices = prices[keep]
+        # quick dtype snapshot (if we reached here, file will exist)
+        with open(DATA_DIR / "_dtype_snapshot.txt", "w", encoding="utf-8") as f:
+            f.write("[positions.dtypes]\n")
+            f.write(str(pos.dtypes) + "\n\n")
+            f.write("[prices.dtypes]\n")
+            f.write(str(prices.dtypes) + "\n\n")
 
-    # Align to full calendar and forward-fill
-    full_idx = pd.date_range(d0, d1, freq="D").date
-    prices = prices.sort_index().reindex(full_idx).ffill()
-    pos    = pos.sort_index().reindex(full_idx).ffill().fillna(0.0)
+        # 6) Multiply strictly on float64 arrays
+        pos_np    = pos.to_numpy(dtype=np.float64, na_value=np.nan)
+        prices_np = prices.to_numpy(dtype=np.float64, na_value=np.nan)
+        nav_vals  = np.nansum(pos_np * prices_np, axis=1)
 
-    # Force numeric (columns only; index stays as dates)
-    for df_name, df in (("prices", prices), ("pos", pos)):
-        for c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    # if anything is still string/object, capture it and stop with a readable message
-        bad = []
-        for c in df.columns:
-            if df[c].dtype.kind not in ("f", "i"):  # not float/int
-                bad.append(c)
-        if bad:
-            dbg = {
-                "frame": df_name,
-                "bad_columns": bad,
-                "sample": df[bad].head(5).astype(str).to_dict(orient="list"),
-            }
-            (DATA_DIR / "debug").mkdir(parents=True, exist_ok=True)
-            (DATA_DIR / "debug" / "dtype_fail.json").write_text(json.dumps(dbg, indent=2), encoding="utf-8")
-            raise RuntimeError(f"{df_name} contains non-numeric columns: {bad} (see data/debug/dtype_fail.json)")
+        nav = pd.DataFrame({
+            "date": pd.to_datetime(full_idx).strftime("%Y-%m-%d"),
+            "nav_gbp": nav_vals.astype("float64")
+        })
+        NAV_CSV.parent.mkdir(parents=True, exist_ok=True)
+        nav.to_csv(NAV_CSV, index=False)
 
-    # Cast to contiguous float64 arrays (no pandas ops beyond this point)
-    pos_np    = pos.to_numpy(dtype=np.float64, na_value=np.nan)
-    prices_np = prices.to_numpy(dtype=np.float64, na_value=np.nan)
+        REPORT.write_text(json.dumps({"missing_symbols": miss, "mapped": mapping}, indent=2),
+                          encoding="utf-8")
+        return NAV_CSV
 
-    # Elementwise multiply, then row-sum (ignores NaN)
-    nav_vals = np.nansum(pos_np * prices_np, axis=1)
-    nav_vals = pd.Series(nav_vals, index=pd.Index(full_idx, name="date"), dtype="float64")
-
-    # Save CSV
-    nav = pd.DataFrame({"date": pd.to_datetime(full_idx).strftime("%Y-%m-%d"),
-                        "nav_gbp": nav_vals.values})
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    nav.to_csv(NAV_CSV, index=False)
-
-    REPORT.write_text(json.dumps({"missing_symbols": miss, "mapped": mapping}, indent=2),
-                      encoding="utf-8")
-    return NAV_CSV
-
-
-    # 5) Report
-    REPORT.write_text(json.dumps({"missing_symbols": miss, "mapped": mapping}, indent=2), encoding="utf-8")
-
-    return NAV_CSV
+    except Exception:
+        _dump_trace("FAILED", pos=locals().get("pos"), prices=locals().get("prices"))
+        raise

@@ -10,6 +10,16 @@ import pandas as pd
 import requests
 import streamlit as st
 
+# ---- FORCE NUMPY BACKEND (disable Arrow/StrDType) ----
+try:
+    pd.options.mode.dtype_backend = "numpy"     # pandas >= 2.1
+except Exception:
+    pass
+try:
+    pd.options.mode.string_storage = "python"   # avoid pyarrow-backed strings
+except Exception:
+    pass
+
 # --- Fetch helper to refresh local JSONs from T212 API ---
 def fetch_to_file(url: str, out_path: Path):
     # headers = {"Authorization": f"Apikey {API_KEY}", "Accept": "application/json"}
@@ -718,7 +728,8 @@ with st.sidebar.expander("Backfill NAV (since 2025-01-01)", expanded=False):
                 else:
                     st.caption("All symbols fetched successfully.")
         except Exception as e:
-            st.error(f"NAV backfill failed: {e}")
+            st.exception(e)
+            st.caption("See data/_backfill_trace.txt for full details.")
 
 # =======================
 # Backend performance plumbing (no UI yet)
