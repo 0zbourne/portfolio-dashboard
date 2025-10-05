@@ -341,12 +341,6 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         prices = (prices.sort_index().reindex(full_idx).ffill().astype("float64"))
         pos    = (pos.sort_index().reindex(full_idx).ffill().fillna(0.0).astype("float64"))
 
-        # --- TEMP AUDIT FOR 8-JUL-2024 (the spike date) ---
-        audit_date = pd.Timestamp("2024-07-08").date()
-        (pos.loc[[audit_date]].T.rename(columns={audit_date:"shares"})
-            .join(prices.loc[[audit_date]].T.rename(columns={audit_date:"price_gbp"}))
-            .to_csv(DATA_DIR / "_audit_2024_07_08.csv"))
-
         # quick dtype snapshot (if we reached here, file will exist)
         with open(DATA_DIR / "_dtype_snapshot.txt", "w", encoding="utf-8") as f:
             f.write("[positions.dtypes]\n")
