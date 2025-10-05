@@ -64,6 +64,92 @@ def _save_open_prices(dct):
     OPEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     OPEN_FILE.write_text(json.dumps(dct, indent=2), encoding="utf-8")
 
+# --- Account cash (GBP) fetcher ---
+ACC_FILE = Path("data") / "account.json"
+
+def _extract_cash_from_json(obj):
+    """
+    Recursively search for plausible 'cash' fields in a dict/list payload.
+    Returns (value, field_path) or (None, None).
+    """
+    candidates = []
+    def walk(o, path=""):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                lk = str(k).lower()
+                newp = f"{path}.{k}" if path else k
+                if isinstance(v, (dict, list)):
+                    walk(v, newp)
+                else:
+                    if any(t in lk for t in ["cash", "availablecash", "available_funds", "freecash", "free_funds", "balance"]):
+                        try:
+                            fv = float(v)
+                            candidates.append((fv, newp))
+                        except Exception:
+                            pass
+        elif isinstance(o, list):
+            for i, it in enumerate(o):
+                walk(it, f"{path}[{i}]")
+    walk(obj)
+    if not candidates:
+        return None, None
+    # Heuristic: take the largest positive number as available cash
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0]
+
+def _fetch_json_quiet(url: str, timeout: int = 10):
+    """Fetch JSON without showing Streamlit banners."""
+    try:
+        try:
+            hdrs = _headers()  # use your existing auth helper if present
+        except Exception:
+            hdrs = {}          # fallback: no headers (will just return None if auth required)
+        r = requests.get(url, headers=hdrs, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+def get_cash_gbp(base_url: str) -> tuple[float | None, str]:
+    """
+    Try a few Trading212 endpoints and cache whatever returns a numeric cash.
+    Returns (cash_gbp, source_label).
+    """
+    # 1) Use cached file if present and recent (< 6h)
+    try:
+        if ACC_FILE.exists() and (datetime.utcnow().timestamp() - ACC_FILE.stat().st_mtime) < 6*3600:
+            data = json.loads(ACC_FILE.read_text(encoding="utf-8"))
+            val, path = _extract_cash_from_json(data)
+            if val is not None:
+                return val, f"{ACC_FILE.name}:{path}"
+    except Exception:
+        pass
+
+    # 2) Try likely endpoints (whichever works first)
+    endpoints = [
+        "/api/v0/equity/account/info",
+        "/api/v0/account/info",
+        "/api/v0/accounts",
+        "/api/v0/equity/account/cash",
+        "/api/v0/account/cash",
+    ]
+    for ep in endpoints:
+        url = f"{base_url}{ep}"
+        data = _fetch_json_quiet(url)
+        if data is not None:
+            try:
+                ACC_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        if isinstance(data, (dict, list)):
+            val, path = _extract_cash_from_json(data)
+            if val is not None:
+                return val, f"{ep}:{path}"
+
+    # 3) Give up
+    return None, "unavailable"
+
 def _anchor_date_iso():
     """
     Use UTC date, but roll back to last business day if it's Saturday/Sunday.
@@ -499,6 +585,70 @@ df["weight_pct"] = np.where(
     (df["total_value_gbp"] / portfolio_total) * 100.0,
     0.0,
 )
+# -------------------------
+# Allocation (incl. Cash)
+# -------------------------
+st.subheader("Allocation (including Cash)")
+
+cash_gbp, cash_src = get_cash_gbp(BASE)
+has_cash = (cash_gbp is not None) and (cash_gbp >= 0)
+
+total_with_cash = portfolio_total + (cash_gbp if has_cash else 0.0)
+
+alloc = df[["symbol", "company", "total_value_gbp"]].copy()
+alloc = alloc.dropna(subset=["total_value_gbp"]).sort_values("total_value_gbp", ascending=False)
+
+rows = []
+for r in alloc.itertuples():
+    w = (float(r.total_value_gbp) / total_with_cash) if total_with_cash > 0 else 0.0
+    label = str(r.symbol) if pd.notna(r.symbol) and str(r.symbol).strip() else str(r.company)
+    rows.append({"label": label, "weight": w})
+
+if has_cash:
+    rows.append({"label": "Cash", "weight": (cash_gbp / total_with_cash) if total_with_cash > 0 else 0.0})
+
+pie = pd.DataFrame(rows)
+
+# Round to 0.1% and fix residual so sum=100.0%
+if not pie.empty:
+    pie["pct"] = (pie["weight"] * 100.0)
+    pie["pct_r"] = pie["pct"].round(1)
+    diff = 100.0 - pie["pct_r"].sum()
+    if abs(diff) >= 0.1:
+        # adjust the largest slice
+        idx = pie["pct"].idxmax()
+        pie.loc[idx, "pct_r"] = pie.loc[idx, "pct_r"] + diff
+    pie["pct_r"] = pie["pct_r"].clip(lower=0)
+else:
+    pie["pct_r"] = []
+
+if pie["pct_r"].sum() <= 0:
+    st.info("No holdings to plot.")
+else:
+    # Donut chart with Altair
+    chart = (
+        alt.Chart(pie)
+        .mark_arc(innerRadius=90)
+        .encode(
+            theta=alt.Theta("pct_r:Q", stack=True, title=None),
+            order=alt.Order("pct_r:Q", sort="descending"),
+            color=alt.Color("label:N", legend=alt.Legend(title=None, orient="right")),
+            tooltip=[
+                alt.Tooltip("label:N", title="Position"),
+                alt.Tooltip("pct_r:Q", title="Weight", format=".1f"),
+            ],
+        )
+        .properties(height=280)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+caption = "Weights by current market value"
+if has_cash:
+    cash_pct = (cash_gbp / total_with_cash * 100.0) if total_with_cash > 0 else 0.0
+    caption += f" • Cash: £{cash_gbp:,.0f} ({cash_pct:.1f}%) • Source: {cash_src}"
+else:
+    caption += " • Cash unavailable (positions only)"
+st.caption(caption + ".")
 
 # --- Day change calculation ---
 # Strategy:
