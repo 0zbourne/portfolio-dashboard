@@ -82,6 +82,22 @@ def _ttm_or_fy(vals: pd.Series, annual: pd.Series) -> float | None:
         return _safe_float(annual.dropna().iloc[0])
     return None
 
+def _latest_snapshot(row_q: pd.Series | None, row_a: pd.Series | None) -> float | None:
+    """
+    Balance-sheet items are snapshots: use the most recent quarterly value,
+    else fall back to the latest annual.
+    """
+    if row_q is not None:
+        v = pd.to_numeric(row_q.dropna(), errors="coerce")
+        if not v.empty:
+            # yfinance lists the most-recent period first
+            return float(v.iloc[0])
+    if row_a is not None:
+        v = pd.to_numeric(row_a.dropna(), errors="coerce")
+        if not v.empty:
+            return float(v.iloc[0])
+    return None
+
 def _compute_metrics_for_symbol(yf_sym: str) -> dict:
     """Return dict with roce, gm, om, cc, ic, and basis ('TTM' or 'FY') or {} if not available."""
     try:
@@ -104,9 +120,9 @@ def _compute_metrics_for_symbol(yf_sym: str) -> dict:
     # Balance sheet
     bs_q = s["bs_q"]; bs_a = s["bs_a"]
     ta_q = _pick_row(bs_q, ["total assets"])
-    cl_q = _pick_row(bs_q, ["total current liabilities"])
+    cl_q = _pick_row(bs_q, ["total current liabilities", "current liabilities"])
     ta_a = _pick_row(bs_a, ["total assets"])
-    cl_a = _pick_row(bs_a, ["total current liabilities"])
+    cl_a = _pick_row(bs_a, ["total current liabilities", "current liabilities"])
 
     # Cashflow
     cf_q = s["cf_q"]; cf_a = s["cf_a"]
@@ -120,8 +136,8 @@ def _compute_metrics_for_symbol(yf_sym: str) -> dict:
     gp   = _ttm_or_fy(gp_q,   gp_a)
     ebit = _ttm_or_fy(ebit_q, ebit_a)
     intexp = _ttm_or_fy(int_q, int_a)  # typically negative, we'll abs()
-    ta   = _ttm_or_fy(ta_q,   ta_a)
-    cl   = _ttm_or_fy(cl_q,   cl_a)
+    ta = _latest_snapshot(ta_q, ta_a)
+    cl = _latest_snapshot(cl_q, cl_a)
     cfo  = _ttm_or_fy(cfo_q,  cfo_a)
     capex= _ttm_or_fy(cap_q,  cap_a)
 
