@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import altair as alt
 
 # ---- FORCE NUMPY BACKEND (disable Arrow/StrDType) ----
 try:
@@ -789,6 +790,54 @@ try:
         st.sidebar.caption(f"Since {perf_start}: Portfolio {since_start_port:.2%} vs S&P {since_start_bench:.2%}")
     if pd.notna(ytd_port) and pd.notna(ytd_bench):
         st.sidebar.caption(f"YTD (backend): Portfolio {ytd_port:.2%} vs S&P {ytd_bench:.2%}")
+
+    # === NAV vs S&P 500 (rebased to 100 at the strategy anchor) ===
+    anchor = "2025-01-01"  # strategy change date
+
+    plot = merged[merged["date"] >= anchor].copy()
+    if plot.empty:
+        st.info("Not enough data after the anchor date to draw the NAV vs S&P chart.")
+    else:
+        # Cumulative indices: 100 * Π(1 + daily return)
+        plot["Portfolio (TWR)"] = (100.0 * (1.0 + plot["r_port"]).cumprod()).astype("float64")
+        plot["S&P 500 (GBP)"]   = (100.0 * (1.0 + plot["r_bench"]).cumprod()).astype("float64")
+
+        st.subheader("NAV vs S&P 500 (rebased to 100)")
+        # Build long-form DF for Altair
+        plot_alt = plot.copy()
+        plot_alt["date"] = pd.to_datetime(plot_alt["date"], errors="coerce")
+        plot_alt = plot_alt.melt(
+            id_vars=["date"],
+            value_vars=["Portfolio (TWR)", "S&P 500 (GBP)"],
+            var_name="series",
+            value_name="index"
+        )
+
+        # Add 5% headroom/footroom so the lines can breathe
+        y_min = float(plot[["Portfolio (TWR)", "S&P 500 (GBP)"]].min().min()) * 0.95
+        y_max = float(plot[["Portfolio (TWR)", "S&P 500 (GBP)"]].max().max()) * 1.05
+
+        chart = (
+            alt.Chart(plot_alt)
+            .mark_line()
+            .encode(
+                x=alt.X("date:T", title=""),
+                y=alt.Y(
+                    "index:Q",
+                    title="Index (rebased = 100)",
+                    scale=alt.Scale(domain=[y_min, y_max], nice=False, zero=False),
+                ),
+                color=alt.Color("series:N", legend=alt.Legend(title=None)),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date"),
+                    alt.Tooltip("series:N", title="Series"),
+                    alt.Tooltip("index:Q", title="Value", format=".2f"),
+                ],
+            )
+            .properties(height=340)
+        )
+
+        st.altair_chart(chart, use_container_width=True)
 
 except Exception as e:
     st.sidebar.info(f"Perf debug unavailable: {e}")
