@@ -745,29 +745,50 @@ try:
 except Exception as e:
     st.sidebar.warning(f"NAV snapshot not updated: {e}")
 
-# 2) (Optional debug) Compute YTD absolute performance vs S&P 500 in GBP
-#    This only shows a quick caption in the sidebar; the real UI will come later.
+# 2) (Optional debug) Compute perf vs S&P 500 in GBP (sidebar captions)
 try:
-    year_start = f"{datetime.utcnow().year}-01-01"
+    # Align benchmark to your actual NAV history window
     today_key = _anchor_date_iso()
 
-    nav = read_nav()
+    nav = read_nav()  # <- Series indexed by date (not a DataFrame)
     flows = build_cash_flows(Path("data") / "transactions.json")
-    port_daily = daily_returns_twr(nav, flows)
+    port_daily = daily_returns_twr(nav, flows)   # DataFrame: [date, r_port]
 
-    sp = get_sp500_daily(year_start, today_key)
+    # Start = earliest NAV index (since read_nav() returns a Series)
+    perf_start = pd.to_datetime(nav.index).min().strftime("%Y-%m-%d")
+
+    # Fetch S&P over same window (GBP returns)
+    sp = get_sp500_daily(perf_start, today_key)  # DataFrame: [date, daily_ret]
+
+    # Make both sides the same type for joining/filters
+    port_daily["date"] = pd.to_datetime(port_daily["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    sp["date"]         = pd.to_datetime(sp["date"],         errors="coerce").dt.strftime("%Y-%m-%d")
 
     # Align on common dates
     merged = (
-        port_daily.rename(columns={"r_port": "r_port"})
-        .merge(sp[["date", "daily_ret"]].rename(columns={"daily_ret": "r_bench"}), on="date", how="inner")
+        port_daily.merge(
+            sp[["date", "daily_ret"]].rename(columns={"daily_ret": "r_bench"}),
+            on="date",
+            how="inner"
+        )
+        .dropna(subset=["r_port", "r_bench"])
+        .sort_values("date")
     )
 
-    # Cumulative returns YTD
-    ytd_port = cumulative_return(merged.rename(columns={"r_port": "r_port"}), year_start, today_key)
-    ytd_bench = float((1 + merged["r_bench"].dropna()).prod() - 1) if not merged.empty else float("nan")
+    # Since-start cumulative
+    since_start_port = cumulative_return(merged, perf_start, today_key)
+    since_start_bench = float((1 + merged["r_bench"]).prod() - 1) if not merged.empty else float("nan")
 
+    # YTD slice (kept for quick scan)
+    year_start = f"{datetime.utcnow().year}-01-01"
+    ytd_slice = merged[(merged["date"] >= year_start) & (merged["date"] <= today_key)]
+    ytd_port  = float((1 + ytd_slice["r_port"]).prod()  - 1) if not ytd_slice.empty else float("nan")
+    ytd_bench = float((1 + ytd_slice["r_bench"]).prod() - 1) if not ytd_slice.empty else float("nan")
+
+    if pd.notna(since_start_port) and pd.notna(since_start_bench):
+        st.sidebar.caption(f"Since {perf_start}: Portfolio {since_start_port:.2%} vs S&P {since_start_bench:.2%}")
     if pd.notna(ytd_port) and pd.notna(ytd_bench):
         st.sidebar.caption(f"YTD (backend): Portfolio {ytd_port:.2%} vs S&P {ytd_bench:.2%}")
+
 except Exception as e:
     st.sidebar.info(f"Perf debug unavailable: {e}")

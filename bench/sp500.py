@@ -35,15 +35,43 @@ def _fetch_fx_usd_gbp(start, end):
 
 def get_sp500_daily(start: str, end: str, cache_path: Path = SP500_CSV):
     """
-    Returns DataFrame with columns: date, close_usd, usd_gbp, close_gbp, daily_ret
-    Also caches to data/sp500_daily.csv
+    DAILY (business-day) S&P proxy in GBP with stable returns.
+    Returns columns: date, close_usd, usd_gbp, close_gbp, daily_ret (all float64).
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    spy = _fetch_spy_stooq()
-    spy = spy[(spy["date"] >= pd.to_datetime(start)) & (spy["date"] <= pd.to_datetime(end))]
-    fx = _fetch_fx_usd_gbp(start, end)
-    df = pd.merge(spy, fx, on="date", how="inner").sort_values("date")
-    df["close_gbp"] = df["close_usd"] * df["usd_gbp"]
-    df["daily_ret"] = df["close_gbp"].pct_change()
+
+    # 1) Business-day calendar
+    s = pd.to_datetime(start).date()
+    e = pd.to_datetime(end).date()
+    cal = pd.bdate_range(s, e).date  # business days only
+
+    # 2) SPY (USD) from Stooq → reindex to daily calendar, ffill/bfill
+    spy = _fetch_spy_stooq().copy()
+    spy["date"] = pd.to_datetime(spy["date"]).dt.date
+    spy = (spy.set_index("date")
+              .reindex(cal)
+              .ffill()
+              .bfill())
+    spy["close_usd"] = pd.to_numeric(spy["close_usd"], errors="coerce").astype("float64")
+
+    # 3) USD→GBP FX from ECB → reindex to daily calendar, ffill/bfill
+    fx = _fetch_fx_usd_gbp(start, end).copy()
+    fx["date"] = pd.to_datetime(fx["date"]).dt.date
+    fx = (fx.set_index("date")
+            .reindex(cal)
+            .ffill()
+            .bfill())
+    fx["usd_gbp"] = pd.to_numeric(fx["usd_gbp"], errors="coerce").astype("float64")
+
+    # 4) Compose daily GBP series and daily returns
+    df = pd.DataFrame(index=cal)
+    df["close_usd"] = spy["close_usd"].astype("float64")
+    df["usd_gbp"]   = fx["usd_gbp"].astype("float64")
+    df["close_gbp"] = (df["close_usd"] * df["usd_gbp"]).astype("float64")
+    df["daily_ret"] = df["close_gbp"].pct_change().fillna(0.0).astype("float64")
+
+    df = df.reset_index().rename(columns={"index": "date"})
+    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+
     df.to_csv(cache_path, index=False)
     return df
