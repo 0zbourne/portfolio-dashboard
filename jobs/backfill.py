@@ -205,10 +205,18 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
         ser = gbp_px.get(ysym)
         if ser is None or ser.dropna().empty:
             missing.append(t); continue
-        med = float(ser.dropna().median()) if ser.notna().any() else np.nan
-        if med and med > 1000:
-            ser = ser / 100.0
-        # final, guaranteed float64 column aligned to calendar
+        # --- robust unit check using yfinance metadata ---
+        try:
+            info = yf.Ticker(ysym).info
+            if info.get("currency") == "GBp":
+                # yfinance reports in pence → convert to pounds
+                ser = ser / 100.0
+        except Exception:
+            # fallback heuristic if metadata is unavailable
+            med = float(ser.dropna().median()) if ser.notna().any() else None
+            if med and med > 1000.0:
+                ser = ser / 100.0
+
         out[t] = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
 
     # ---- USD listings (NumPy multiply only) ----
@@ -332,6 +340,12 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         full_idx = pd.date_range(d0, d1, freq="D").date
         prices = (prices.sort_index().reindex(full_idx).ffill().astype("float64"))
         pos    = (pos.sort_index().reindex(full_idx).ffill().fillna(0.0).astype("float64"))
+
+        # --- TEMP AUDIT FOR 8-JUL-2024 (the spike date) ---
+        audit_date = pd.Timestamp("2024-07-08").date()
+        (pos.loc[[audit_date]].T.rename(columns={audit_date:"shares"})
+            .join(prices.loc[[audit_date]].T.rename(columns={audit_date:"price_gbp"}))
+            .to_csv(DATA_DIR / "_audit_2024_07_08.csv"))
 
         # quick dtype snapshot (if we reached here, file will exist)
         with open(DATA_DIR / "_dtype_snapshot.txt", "w", encoding="utf-8") as f:

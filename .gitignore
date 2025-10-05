@@ -5,3 +5,6 @@ __pycache__/
 data/*.json
 "data/nav_daily.csv" 
 "data/_*.txt"        
+"data/nav_daily.csv"       
+"data/_*.csv"              
+"data/_*.txt"              
