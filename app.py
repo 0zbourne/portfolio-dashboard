@@ -10,6 +10,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import altair as alt
+from jobs.fundamentals import ensure_fundamentals, load_fundamentals
 
 # ---- FORCE NUMPY BACKEND (disable Arrow/StrDType) ----
 try:
@@ -675,6 +676,46 @@ if df["day_change_gbp"].isna().all():
     notes.append("Day change anchored to today’s first seen price (or map fields in the sidebar if your API provides them).")
 if notes:
     st.caption(" • ".join(notes))
+
+# =======================
+# Portfolio Quality Strip (TTM weighted by current MV)
+# =======================
+try:
+    # Build decimal weights (0..1) from today's GBP value
+    wdf = df[["symbol", "total_value_gbp"]].copy()
+    wdf["total_value_gbp"] = pd.to_numeric(wdf["total_value_gbp"], errors="coerce")
+    wdf = wdf.dropna(subset=["total_value_gbp"])
+    tot_mv = float(wdf["total_value_gbp"].sum())
+    weights = {str(r.symbol): float(r.total_value_gbp) / tot_mv for r in wdf.itertuples()} if tot_mv > 0 else {}
+
+    # Ensure fundamentals cache exists/updated weekly
+    ensure_fundamentals(weights)
+    fund = load_fundamentals()
+    agg = (fund or {}).get("portfolio_weighted", {})
+
+    st.subheader("Portfolio quality (TTM, weight-adjusted)")
+    k1, k2, k3, k4, k5 = st.columns(5)
+
+    def _fmt_pct(x):
+        return "N/A" if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) else f"{x*100:.0f}%"
+    def _fmt_ic(x):
+        return "N/A" if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) else f"{x:.1f}×"
+
+    k1.metric("ROCE", _fmt_pct(agg.get("roce")))
+    k2.metric("Gross margin", _fmt_pct(agg.get("gm")))
+    k3.metric("Operating margin", _fmt_pct(agg.get("om")))
+    k4.metric("Cash conversion (FCF/EBIT)", _fmt_pct(agg.get("cc")))
+    k5.metric("Interest cover", _fmt_ic(agg.get("ic")))
+
+    with st.expander("Quality audit (per-ticker)", expanded=False):
+        from jobs.fundamentals import FUND_AUDIT, FUND_JSON
+        st.caption(f"Data source: yfinance. Basis: TTM (fallback FY). Cache: weekly. File: {FUND_JSON}")
+        if FUND_AUDIT.exists():
+            st.dataframe(pd.read_csv(FUND_AUDIT), use_container_width=True)
+        else:
+            st.write("Audit file not available yet.")
+except Exception as e:
+    st.warning(f"Quality strip unavailable: {e}")
 
 # ---- Render dividends timeline ----
 from pandas.api.types import is_datetime64_any_dtype as is_datetime
