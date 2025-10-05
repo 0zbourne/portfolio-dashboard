@@ -8,3 +8,6 @@ data/*.json
 "data/nav_daily.csv"       
 "data/_*.csv"              
 "data/_*.txt"              
+data\sp500_daily.csv
+data/fundamentals.json
+data/fundamentals_audit.csv
