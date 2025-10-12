@@ -77,17 +77,24 @@ def daily_returns_twr(nav: pd.Series, flows: pd.DataFrame | None = None) -> pd.D
     # Denominator: previous NAV + same-day flow
     denom = nav.shift(1) + flow_s
 
-    # Compute daily return; invalid denoms produce NaN (not inf)
-    r = nav / denom - 1.0
+    # Compute daily return as a Series aligned to NAV index
+    r = pd.Series(
+        np.where(denom > 0, nav / denom - 1.0, 0.0),
+        index=nav.index,
+        dtype="float64",
+    )
 
-    # First day has no denominator: set to 0.0 for continuity
+    # First day has no valid denominator: set to 0.0 for continuity
     if len(r) > 0:
         r.iloc[0] = 0.0
 
     # Drop non-finite values
     r = r.replace([np.inf, -np.inf], np.nan).dropna()
 
-    out = pd.DataFrame({"date": r.index, "r_port": r.values})
+    # Emit DataFrame expected by the rest of the pipeline
+    out = pd.DataFrame(
+        {"date": r.index.astype("datetime64[ns]"), "r_port": r.values}
+    )
     return out
 
 def cumulative_return(obj, start: str | None = None, end: str | None = None) -> float:
