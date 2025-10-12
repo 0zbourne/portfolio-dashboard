@@ -60,12 +60,19 @@ def daily_returns_twr(nav: pd.Series, flows: pd.DataFrame | None = None) -> pd.D
         f["date"] = pd.to_datetime(f["date"], errors="coerce")
         f = f.dropna(subset=["date"])
         f["amount_gbp"] = pd.to_numeric(f["amount_gbp"], errors="coerce")
-        flow_s = f.groupby("date")["amount_gbp"].sum()
-    else:
-        flow_s = pd.Series(dtype="float64")
+        # Sum multiple events per calendar day
+        per_day = f.groupby("date")["amount_gbp"].sum().sort_index()
 
-    # Align flows to nav index
-    flow_s = flow_s.reindex(nav.index, fill_value=0.0)
+        # Carry flows forward to the next valuation date:
+        # 1) cumulative sum at flow dates
+        cum = per_day.cumsum()
+
+        # 2) map cumulative to NAV dates with forward-fill, then take differences between NAV dates
+        cum_on_nav = cum.reindex(nav.index, method="ffill").fillna(0.0)
+        flow_s = cum_on_nav.diff().fillna(cum_on_nav)
+    else:
+        # no flows at all
+        flow_s = pd.Series(0.0, index=nav.index, dtype="float64")
 
     # Denominator: previous NAV + same-day flow
     denom = nav.shift(1) + flow_s
