@@ -30,10 +30,11 @@ def _freshness(path: Path) -> str:
 def _public_gate():
     if PUBLIC_MODE and PUBLIC_TOKEN:
         try:
-            qp = st.experimental_get_query_params()
-            tok = (qp.get("token") or [""])[0]
+            # New API: no "experimental"
+            tok = str(st.query_params.get("token", "")).strip()
         except Exception:
             tok = ""
+        # Exact match; keep it strict
         if tok != PUBLIC_TOKEN:
             st.error("Access denied. Missing or invalid token.")
             st.stop()
