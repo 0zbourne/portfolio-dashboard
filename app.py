@@ -69,41 +69,59 @@ ACC_FILE = Path("data") / "account.json"
 
 def _extract_cash_from_json(obj):
     """
-    Recursively search for plausible 'cash' fields in a dict/list payload.
-    Returns (value, field_path) or (None, None).
+    Return (cash_gbp, field_path) from a T212 account payload.
+    Only accept explicit cash-like keys. Ignore pie cash and ids.
     """
-    candidates = []
+    # Accept only these exact fields (lowercased last key name)
+    preferred = {
+        "free", "freecash", "free_funds",
+        "availablecash", "available_funds",
+        "cashbalance", "cash_balance",
+        "available"
+    }
+    # Explicitly ignore these (and anything with 'piecash' in the key)
+    deny = {"id", "total", "invested", "ppl", "result", "blocked"}
+
+    found = []  # list of (path, value)
+
     def walk(o, path=""):
         if isinstance(o, dict):
             for k, v in o.items():
                 lk = str(k).lower()
+                if "piecash" in lk or lk in deny:
+                    continue
                 newp = f"{path}.{k}" if path else k
                 if isinstance(v, (dict, list)):
                     walk(v, newp)
                 else:
-                    if any(t in lk for t in ["cash", "availablecash", "available_funds", "freecash", "free_funds", "balance"]):
+                    # accept only if key is explicitly in preferred
+                    last = newp.split(".")[-1].lower()
+                    if last in preferred:
                         try:
                             fv = float(v)
-                            candidates.append((fv, newp))
+                            if fv >= 0:
+                                found.append((newp, fv))
                         except Exception:
                             pass
         elif isinstance(o, list):
             for i, it in enumerate(o):
                 walk(it, f"{path}[{i}]")
+
     walk(obj)
-    if not candidates:
-        return None, None
-    # Heuristic: take the largest positive number as available cash
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0]
+
+    if found:
+        # choose the first preferred match we encountered (deterministic)
+        p, val = found[0]
+        return val, p
+
+    return None, None
 
 def _fetch_json_quiet(url: str, timeout: int = 10):
-    """Fetch JSON without showing Streamlit banners."""
+    """Fetch JSON quietly; use API key if present. No Streamlit banners."""
     try:
-        try:
-            hdrs = _headers()  # use your existing auth helper if present
-        except Exception:
-            hdrs = {}          # fallback: no headers (will just return None if auth required)
+        # If you’ve set T212_API_KEY in env, we’ll pass it; otherwise do unauthenticated call
+        auth = os.getenv("T212_API_KEY", "")
+        hdrs = {"Authorization": auth, "Accept": "application/json"} if auth else {}
         r = requests.get(url, headers=hdrs, timeout=timeout)
         if r.status_code == 200:
             return r.json()
@@ -137,15 +155,16 @@ def get_cash_gbp(base_url: str) -> tuple[float | None, str]:
     for ep in endpoints:
         url = f"{base_url}{ep}"
         data = _fetch_json_quiet(url)
-        if data is not None:
-            try:
-                ACC_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            except Exception:
-                pass
         if isinstance(data, (dict, list)):
             val, path = _extract_cash_from_json(data)
             if val is not None:
+                # cache only a payload that actually contained a valid cash figure
+                try:
+                    ACC_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
                 return val, f"{ep}:{path}"
+        # else keep probing other endpoints
 
     # 3) Give up
     return None, "unavailable"
