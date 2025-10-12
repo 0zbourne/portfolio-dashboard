@@ -12,6 +12,32 @@ import streamlit as st
 import altair as alt
 from jobs.fundamentals import ensure_fundamentals, load_fundamentals
 
+# --- Public mode & helpers ---
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+PUBLIC_MODE = os.getenv("PUBLIC_MODE", "0") == "1"
+PUBLIC_TOKEN = os.getenv("PUBLIC_TOKEN", "")  # optional shared secret for ?token=...
+
+def _freshness(path: Path) -> str:
+    try:
+        ts = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        return ts.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return "unknown"
+
+def _public_gate():
+    if PUBLIC_MODE and PUBLIC_TOKEN:
+        try:
+            qp = st.experimental_get_query_params()
+            tok = (qp.get("token") or [""])[0]
+        except Exception:
+            tok = ""
+        if tok != PUBLIC_TOKEN:
+            st.error("Access denied. Missing or invalid token.")
+            st.stop()
+
 # ---- FORCE NUMPY BACKEND (disable Arrow/StrDType) ----
 try:
     pd.options.mode.dtype_backend = "numpy"     # pandas >= 2.1
@@ -32,10 +58,12 @@ def fetch_to_file(url: str, out_path: Path):
         data = r.json()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        st.sidebar.success(f"Fetched {out_path.name}")
+        if not PUBLIC_MODE:
+            st.sidebar.success(f"Fetched {out_path.name}")
         return data
     except Exception as e:
-        st.sidebar.error(f"Fetch failed for {url}: {e}")
+        if not PUBLIC_MODE:
+            st.sidebar.error(f"Fetch failed for {url}: {e}")
         return None
 
 API_KEY = os.getenv("T212_API_KEY")
@@ -46,6 +74,10 @@ if not API_KEY:
 BASE = os.getenv("T212_API_BASE", "https://live.trading212.com") # use https://demo.trading212.com for practice  # practice API host
 
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
+
+if PUBLIC_MODE:
+    st.markdown('<meta name="robots" content="noindex,nofollow">', unsafe_allow_html=True)
+_public_gate()
 
 DATA = Path("data") / "portfolio.json"
 
@@ -608,6 +640,7 @@ df["weight_pct"] = np.where(
 # Allocation (incl. Cash)
 # -------------------------
 st.subheader("Allocation (including Cash)")
+st.caption(f"As of { _freshness(Path('data') / 'account.json') }")
 
 cash_gbp, cash_src = get_cash_gbp(BASE)
 has_cash = (cash_gbp is not None) and (cash_gbp >= 0)
@@ -863,6 +896,7 @@ try:
     agg = (fund or {}).get("portfolio_weighted", {})
 
     st.subheader("Portfolio quality (TTM, weight-adjusted)")
+    st.caption(f"As of { _freshness(Path('data') / 'fundamentals.json') }")
     k1, k2, k3, k4, k5 = st.columns(5)
 
     def _fmt_pct(x):
@@ -965,6 +999,67 @@ try:
     flows = build_cash_flows(Path("data") / "transactions.json")
     port_daily = daily_returns_twr(nav, flows)   # DataFrame: [date, r_port]
 
+    # ================= TWR AUDIT: writes data/_twr_audit.csv =================
+    # Rebuild flows onto NAV dates (weekend/holiday flows carried to next NAV date),
+    # recompute textbook TWR, and compare to pipeline r_port.
+    try:
+        # NAV as a DataFrame (date string for joins)
+        nav_df = pd.DataFrame({"date": pd.to_datetime(nav.index).strftime("%Y-%m-%d"),
+                               "nav": pd.to_numeric(nav.values, errors="coerce")})
+        nav_df = nav_df.sort_values("date")
+
+        # Raw flows per calendar day from transactions.json
+        from pdperf.cashflows import build_cash_flows as _build_cf  # already imported above, but ensure local alias
+        _flows = _build_cf(Path("data") / "transactions.json")
+        _flows["date"] = pd.to_datetime(_flows["date"], errors="coerce")
+        _flows = _flows.dropna(subset=["date"])
+        _flows["amount_gbp"] = pd.to_numeric(_flows["amount_gbp"], errors="coerce").fillna(0.0)
+        per_day = (_flows.groupby(_flows["date"])["amount_gbp"].sum().sort_index())
+
+        # Carry flows forward to next NAV date by differencing cumulative sums on NAV index
+        cum = per_day.cumsum()
+        flow_on_nav = cum.reindex(pd.to_datetime(nav_df["date"]), method="ffill").fillna(0.0)
+        flow_on_nav = flow_on_nav.diff().fillna(flow_on_nav)  # first NAV date gets initial cumulative
+        nav_df["flow_gbp"] = flow_on_nav.values
+
+        # Textbook TWR
+        nav_df["nav_prev"] = nav_df["nav"].shift(1)
+        nav_df["denom"] = nav_df["nav_prev"] + nav_df["flow_gbp"]
+        nav_df["r_t_calc"] = (nav_df["nav"] / nav_df["denom"]) - 1.0
+        nav_df.loc[(nav_df["denom"] <= 0) | (~np.isfinite(nav_df["r_t_calc"])), "r_t_calc"] = 0.0
+
+        # Compare to pipeline r_port
+        pdaily = port_daily.copy()
+        pdaily["date"] = pd.to_datetime(pdaily["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+        aud = nav_df.merge(pdaily[["date", "r_port"]], on="date", how="left")
+        if "r_port" in aud.columns:
+            aud["diff_bp"] = (aud["r_t_calc"] - aud["r_port"]) * 1e4  # basis points
+
+        # Compounded totals from first valid denominator
+        anchor_idx = aud["denom"].first_valid_index()
+        if anchor_idx is not None:
+            aud["cum_calc"] = (1.0 + aud.loc[anchor_idx:, "r_t_calc"]).cumprod().reindex(aud.index).fillna(np.nan) - 1.0
+            if "r_port" in aud.columns:
+                aud["cum_pipe"] = (1.0 + aud.loc[anchor_idx:, "r_port"]).cumprod().reindex(aud.index).fillna(np.nan) - 1.0
+
+        # Save concise audit
+        cols = ["date", "nav_prev", "flow_gbp", "denom", "nav", "r_t_calc"]
+        if "r_port" in aud.columns:
+            cols += ["r_port", "diff_bp", "cum_calc", "cum_pipe"]
+        out = aud[cols].sort_values("date")
+        (Path("data")).mkdir(parents=True, exist_ok=True)
+        out.to_csv(Path("data") / "_twr_audit.csv", index=False)
+
+        if not PUBLIC_MODE:
+            st.caption("Perf audit written → data/_twr_audit.csv")
+
+    except Exception as _e:
+        if not PUBLIC_MODE:
+            st.warning(f"TWR audit unavailable: {_e}")
+
+    # ========================================================================
+
     # Start = earliest NAV index (since read_nav() returns a Series)
     perf_start = pd.to_datetime(nav.index).min().strftime("%Y-%m-%d")
 
@@ -1013,6 +1108,7 @@ try:
         plot["S&P 500 (GBP)"]   = (100.0 * (1.0 + plot["r_bench"]).cumprod()).astype("float64")
 
         st.subheader("NAV vs S&P 500 (rebased to 100)")
+        st.caption(f"As of { _freshness(Path('data') / 'nav_daily.csv') }")
         # Build long-form DF for Altair
         plot_alt = plot.copy()
         plot_alt["date"] = pd.to_datetime(plot_alt["date"], errors="coerce")
