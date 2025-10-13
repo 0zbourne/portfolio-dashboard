@@ -7,6 +7,13 @@ import pandas as pd
 import requests
 import numpy as np
 
+def _t212_headers():
+    key = os.getenv("T212_API_KEY", "").strip()
+    # allow either "abc..." or "Apikey abc..."
+    if key and not key.lower().startswith("apikey "):
+        key = f"Apikey {key}"
+    return {"Authorization": key, "Accept": "application/json"}
+
 # --- Hard-disable Arrow & nullable dtypes so everything is NumPy-native ---
 try:
     pd.options.mode.dtype_backend = "numpy"         # pandas >=2.1
@@ -45,7 +52,7 @@ def _paged_get(url: str):
     items = []
     next_url = url
     for _ in range(1000):  # hard stop
-        r = requests.get(next_url, headers=_auth_headers(), timeout=20)
+        r = requests.get(next_url, headers=_t212_headers(), timeout=20)
         r.raise_for_status()
         payload = r.json()
         chunk = payload.get("items", payload if isinstance(payload, list) else [])
