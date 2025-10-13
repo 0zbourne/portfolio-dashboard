@@ -64,7 +64,7 @@ def fetch_to_file(url: str, out_path: Path, timeout: int = 20):
             pass
 
     # 2) Try network
-    headers = {"Authorization": API_KEY, "Accept": "application/json"}  # If your API needs 'Apikey ', change here.
+    headers = _auth_header()
     try:
         r = requests.get(url, headers=headers, timeout=timeout)
         r.raise_for_status()
@@ -87,9 +87,18 @@ def fetch_to_file(url: str, out_path: Path, timeout: int = 20):
     return None
 
 API_KEY = os.getenv("T212_API_KEY")
-if not API_KEY:
+if not PUBLIC_MODE and not API_KEY:
     st.error("Missing T212 API key — set it with setx T212_API_KEY ...")
     st.stop()
+
+def _auth_header() -> dict:
+    """Return Trading212 Authorization header with the correct 'Apikey ' prefix."""
+    key = os.getenv("T212_API_KEY", "") or ""
+    if not key:
+        return {}
+    if key.lower().startswith("apikey "):
+        return {"Authorization": key, "Accept": "application/json"}
+    return {"Authorization": f"Apikey {key}", "Accept": "application/json"}
 
 BASE = os.getenv("T212_API_BASE", "https://live.trading212.com") # use https://demo.trading212.com for practice  # practice API host
 
@@ -172,8 +181,7 @@ def _fetch_json_quiet(url: str, timeout: int = 10):
     """Fetch JSON quietly; use API key if present. No Streamlit banners."""
     try:
         # If you’ve set T212_API_KEY in env, we’ll pass it; otherwise do unauthenticated call
-        auth = os.getenv("T212_API_KEY", "")
-        hdrs = {"Authorization": auth, "Accept": "application/json"} if auth else {}
+        hdrs = _auth_header()
         r = requests.get(url, headers=hdrs, timeout=timeout)
         if r.status_code == 200:
             return r.json()
@@ -298,15 +306,19 @@ def load_portfolio(cache_bust: tuple):
 HIST_FROM = "1970-01-01"
 HIST_TO   = "2100-01-01" # Wide date range so history isn't empty
 
-fetch_to_file(f"{BASE}/api/v0/equity/portfolio", Path("data/portfolio.json"))
-fetch_to_file(
-    f"{BASE}/api/v0/history/transactions?from={HIST_FROM}&to={HIST_TO}",
-    Path("data/transactions.json")
-)
-fetch_to_file(
-    f"{BASE}/api/v0/history/dividends?from={HIST_FROM}&to={HIST_TO}",
-    Path("data/dividends.json")
-)
+# --- Refresh JSONs on each run (skip in PUBLIC_MODE) ---
+if not PUBLIC_MODE:
+    fetch_to_file(f"{BASE}/api/v0/equity/portfolio", Path("data/portfolio.json"))
+    fetch_to_file(
+        f"{BASE}/api/v0/history/transactions?from={HIST_FROM}&to={HIST_TO}",
+        Path("data/transactions.json")
+    )
+    fetch_to_file(
+        f"{BASE}/api/v0/history/dividends?from={HIST_FROM}&to={HIST_TO}",
+        Path("data/dividends.json")
+    )
+else:
+    st.sidebar.info("Public mode: using committed cache (no live Trading212 calls).")
 
 # Warning if files are empty
 for p in [Path("data/portfolio.json"), Path("data/transactions.json"), Path("data/dividends.json")]:
@@ -987,22 +999,26 @@ else:
 with st.sidebar.expander("Backfill NAV (since 2025-01-01)", expanded=False):
     st.write("Rebuild daily NAV in GBP from **orders** + yfinance prices. Optional overrides: data/ticker_overrides.json")
     start_str = st.text_input("Start date", value="2025-01-01")
-    if st.button("Run NAV backfill"):
-        try:
-            from jobs.backfill import backfill_nav_from_orders
-            out_path = backfill_nav_from_orders(start=start_str)
-            st.success(f"NAV backfill complete → {out_path}")
-            rep_path = Path("data") / "backfill_report.json"
-            if rep_path.exists():
-                rep = json.loads(rep_path.read_text(encoding="utf-8"))
-                missing = rep.get("missing_symbols", [])
-                if missing:
-                    st.warning(f"No price history for: {', '.join(missing)}. Add mappings in data/ticker_overrides.json.")
-                else:
-                    st.caption("All symbols fetched successfully.")
-        except Exception as e:
-            st.exception(e)
-            st.caption("See data/_backfill_trace.txt for full details.")
+
+    if PUBLIC_MODE:
+        st.info("Disabled in public mode. Run locally and commit data/nav_daily.csv.")
+    else:
+        if st.button("Run NAV backfill"):
+            try:
+                from jobs.backfill import backfill_nav_from_orders
+                out_path = backfill_nav_from_orders(start=start_str)
+                st.success(f"NAV backfill complete → {out_path}")
+                rep_path = Path("data") / "backfill_report.json"
+                if rep_path.exists():
+                    rep = json.loads(rep_path.read_text(encoding="utf-8"))
+                    missing = rep.get("missing_symbols", [])
+                    if missing:
+                        st.warning(f"No price history for: {', '.join(missing)}. Add mappings in data/ticker_overrides.json.")
+                    else:
+                        st.caption("All symbols fetched successfully.")
+            except Exception as e:
+                st.exception(e)
+                st.caption("See data/_backfill_trace.txt for full details.")
 
 # =======================
 # Backend performance plumbing (no UI yet)
