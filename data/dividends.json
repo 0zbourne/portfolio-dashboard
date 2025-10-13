@@ -1,0 +1,205 @@
+{
+  "items": [
+    {
+      "ticker": "GAWl_EQ",
+      "reference": "c09fbd20-6619-4841-b73e-1b037cd0cd13",
+      "quantity": 114.0,
+      "amount": 62.7,
+      "grossAmountPerShare": 55.0,
+      "amountInEuro": 71.847642,
+      "paidOn": "2025-10-03T15:30:32.000+03:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "LSEl_EQ",
+      "reference": "96c03110-166e-472b-8a6a-4dfe6021ba44",
+      "quantity": 27.0,
+      "amount": 12.69,
+      "grossAmountPerShare": 47.0,
+      "amountInEuro": 14.626556,
+      "paidOn": "2025-09-17T14:28:37.000+03:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "GOOGL_US_EQ",
+      "reference": "8a252d6d-b97f-4c8a-83c0-5784ec800168",
+      "quantity": 79.0,
+      "amount": 10.39,
+      "grossAmountPerShare": 0.21,
+      "amountInEuro": 12.018925,
+      "paidOn": "2025-09-15T15:54:12.000+03:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "HLMAl_EQ",
+      "reference": "b85ab569-c71b-4c10-9e07-7601011e4f98",
+      "quantity": 87.0,
+      "amount": 12.28,
+      "grossAmountPerShare": 14.12,
+      "amountInEuro": 14.24247,
+      "paidOn": "2025-08-15T13:09:48.000+03:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "GAWl_EQ",
+      "reference": "245507c6-b644-4215-a9cb-977993c5411d",
+      "quantity": 114.0,
+      "amount": 96.9,
+      "grossAmountPerShare": 85.0,
+      "amountInEuro": 112.359551,
+      "paidOn": "2025-08-15T12:41:05.000+03:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "MA_US_EQ",
+      "reference": "b8fa55fa-d8a0-4e4a-bcaf-0ca86499f738",
+      "quantity": 7.0,
+      "amount": 3.37,
+      "grossAmountPerShare": 0.76,
+      "amountInEuro": 3.886115,
+      "paidOn": "2025-08-08T16:06:04.000+03:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "GOOGL_US_EQ",
+      "reference": "1a3f5c21-6ad7-4136-b810-873d03481564",
+      "quantity": 77.0,
+      "amount": 10.11,
+      "grossAmountPerShare": 0.21,
+      "amountInEuro": 11.852147,
+      "paidOn": "2025-06-16T16:10:41.000+03:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "LSEl_EQ",
+      "reference": "4ed253d2-336d-4043-b12c-3127a4598542",
+      "quantity": 27.0,
+      "amount": 24.03,
+      "grossAmountPerShare": 89.0,
+      "amountInEuro": 28.414331,
+      "paidOn": "2025-05-21T13:54:50.000+03:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "MA_US_EQ",
+      "reference": "5db33b3b-1f32-4da3-96c0-c33ec169428b",
+      "quantity": 7.0,
+      "amount": 3.42,
+      "grossAmountPerShare": 0.76,
+      "amountInEuro": 4.034161,
+      "paidOn": "2025-05-09T16:47:17.000+03:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "GAWl_EQ",
+      "reference": "9d669e01-0c42-4f23-84c3-cc45a83591cb",
+      "quantity": 114.0,
+      "amount": 114.0,
+      "grossAmountPerShare": 100.0,
+      "amountInEuro": 134.136584,
+      "paidOn": "2025-05-07T16:44:06.000+03:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "GOOGL_US_EQ",
+      "reference": "1f77ea02-6794-4ab8-ac59-795945b5a23f",
+      "quantity": 59.0,
+      "amount": 7.75,
+      "grossAmountPerShare": 0.2,
+      "amountInEuro": 9.21522,
+      "paidOn": "2025-03-17T16:39:59.000+02:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "GAWl_EQ",
+      "reference": "acdd7679-6360-4042-98cc-fe77eeafaac6",
+      "quantity": 114.0,
+      "amount": 176.7,
+      "grossAmountPerShare": 155.0,
+      "amountInEuro": 213.963964,
+      "paidOn": "2025-02-28T15:57:51.000+02:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "GAWl_EQ",
+      "reference": "92520834-e7bd-49a1-bf78-7d207baff5d6",
+      "quantity": 114.0,
+      "amount": 91.2,
+      "grossAmountPerShare": 80.0,
+      "amountInEuro": 109.656242,
+      "paidOn": "2025-02-14T14:18:57.000+02:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "MA_US_EQ",
+      "reference": "08c3876b-9838-4c98-a89d-f93339cace8b",
+      "quantity": 6.0,
+      "amount": 3.12,
+      "grossAmountPerShare": 0.76,
+      "amountInEuro": 3.741905,
+      "paidOn": "2025-02-07T17:35:50.000+02:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "AHTl_EQ",
+      "reference": "23403381-8cc4-4650-be42-d7b1b591d776",
+      "quantity": 25.0,
+      "amount": 7.25,
+      "grossAmountPerShare": 28.9831736575,
+      "amountInEuro": 8.697321,
+      "paidOn": "2025-02-07T17:28:07.000+02:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "HLMAl_EQ",
+      "reference": "77eb027f-a9e8-461a-bef7-a21cd11c685d",
+      "quantity": 87.0,
+      "amount": 7.83,
+      "grossAmountPerShare": 9.0,
+      "amountInEuro": 9.363341,
+      "paidOn": "2025-01-31T13:48:47.000+02:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "GOOGL_US_EQ",
+      "reference": "255b479e-3845-44a2-b78d-817342f540e1",
+      "quantity": 40.0,
+      "amount": 5.38,
+      "grossAmountPerShare": 0.2,
+      "amountInEuro": 6.488807,
+      "paidOn": "2024-12-16T16:40:36.000+02:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "GAWl_EQ",
+      "reference": "839aa2db-59aa-4230-820f-55786feb8724",
+      "quantity": 114.0,
+      "amount": 96.9,
+      "grossAmountPerShare": 85.0,
+      "amountInEuro": 116.498551,
+      "paidOn": "2024-11-29T14:29:00.000+02:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "MA_US_EQ",
+      "reference": "a7d7e90c-27bc-44b3-8085-52de827b010b",
+      "quantity": 6.0,
+      "amount": 2.59,
+      "grossAmountPerShare": 0.66,
+      "amountInEuro": 3.112607,
+      "paidOn": "2024-11-08T13:27:57.000+02:00",
+      "type": "DIVIDEND"
+    },
+    {
+      "ticker": "RMVl_EQ",
+      "reference": "86736e4f-20d8-4287-8e21-fd07badab4c3",
+      "quantity": 165.0,
+      "amount": 6.11,
+      "grossAmountPerShare": 3.7,
+      "amountInEuro": 7.325612,
+      "paidOn": "2024-10-25T13:34:53.000+03:00",
+      "type": "DIVIDEND"
+    }
+  ],
+  "nextPagePath": "/api/v0/history/dividends?limit=20&cursor=77725510"
+}

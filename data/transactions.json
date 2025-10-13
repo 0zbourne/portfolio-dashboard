@@ -1,0 +1,125 @@
+{
+  "items": [
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "4007f281-ea89-4e15-ac35-2dccf3c353e5",
+      "dateTime": "2025-10-11T00:07:59.925Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.02,
+      "reference": "86ca6611-6d87-4bb4-9c07-8895e4d7fa1b",
+      "dateTime": "2025-10-08T00:07:54.574Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.02,
+      "reference": "936f87a9-8b79-43bc-865c-48de6a5a56c9",
+      "dateTime": "2025-10-07T00:08:01.202Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.06,
+      "reference": "77feb401-2c14-4be3-8e0d-07ca15fe806b",
+      "dateTime": "2025-10-06T00:07:59.114Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 500.0,
+      "reference": "d57a728d-a6c1-4607-b4ae-17152b6500b0",
+      "dateTime": "2025-10-05T19:03:12.400Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "fbca290c-e9ed-44f7-a858-e010dd578467",
+      "dateTime": "2025-10-05T00:08:03.226Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "eb693eea-68ee-47ed-871e-8849a57467f3",
+      "dateTime": "2025-10-04T00:07:55.420Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.04,
+      "reference": "751d7b98-19db-4da5-8638-ff8c09469fe9",
+      "dateTime": "2025-10-01T00:09:16.482Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 250.0,
+      "reference": "072dea33-9b2d-41c5-b86f-98cd7952c3b8",
+      "dateTime": "2025-09-30T03:15:37.069Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "08c07f96-c0fc-4f78-acc5-906f612baa72",
+      "dateTime": "2025-09-30T00:09:01.316Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "c351044b-7692-4970-b0b0-a0e1208b31bd",
+      "dateTime": "2025-09-29T00:09:16.058Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "da6bce21-2d0e-42f1-80a2-28ac786ed956",
+      "dateTime": "2025-09-27T00:09:08.430Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "d5abd6c1-c8ad-4ffb-93b8-3bdba1f538a9",
+      "dateTime": "2025-09-26T00:09:23.358Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "3de56ca9-ec27-4f73-9763-f5aec0847020",
+      "dateTime": "2025-09-25T00:09:03.969Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "c58a51a6-4a2b-45aa-8018-77f1aaa0ed7a",
+      "dateTime": "2025-09-24T00:09:20.483Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "a6e02856-4fc4-4a5e-af7d-cff2f7acb505",
+      "dateTime": "2025-09-22T00:09:09.220Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "50bd1009-fbaf-46dd-8e31-25678f9514da",
+      "dateTime": "2025-09-21T00:08:58.668Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "bba07c23-fcf6-4a89-8258-bfdbcc96aa5b",
+      "dateTime": "2025-09-20T00:09:18.488Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "86260e51-cd13-457a-8b97-25b51f06413a",
+      "dateTime": "2025-09-19T00:09:03.167Z"
+    },
+    {
+      "type": "DEPOSIT",
+      "amount": 0.01,
+      "reference": "6e1d3952-5c0a-4905-9abc-9e71081a3f74",
+      "dateTime": "2025-09-18T00:08:46.189Z"
+    }
+  ],
+  "nextPagePath": "limit=20&cursor=4f935a16-1716-4b6f-944f-335ca69c99d8&time=2025-09-16T00:08:43.540Z"
+}

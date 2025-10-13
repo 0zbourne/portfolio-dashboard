@@ -1,0 +1,54 @@
+[
+  {
+    "ticker": "GAWl_EQ",
+    "quantity": 116.0,
+    "averagePrice": 8733.03103448,
+    "currentPrice": 14470.0,
+    "ppl": 6654.88,
+    "fxPpl": null,
+    "initialFillDate": "2024-06-07T10:55:02.000+03:00",
+    "frontend": "ANDROID",
+    "maxBuy": 2342.0,
+    "maxSell": 2458.0,
+    "pieQuantity": 0.0
+  },
+  {
+    "ticker": "MSCI_US_EQ",
+    "quantity": 2.0,
+    "averagePrice": 563.93,
+    "currentPrice": 546.5,
+    "ppl": -18.85,
+    "fxPpl": 7.22,
+    "initialFillDate": "2025-10-01T17:27:46.000+03:00",
+    "frontend": "ANDROID",
+    "maxBuy": 23728.0,
+    "maxSell": 23730.0,
+    "pieQuantity": 0.0
+  },
+  {
+    "ticker": "GOOGL_US_EQ",
+    "quantity": 79.0,
+    "averagePrice": 151.92696203,
+    "currentPrice": 235.77,
+    "ppl": 4552.61,
+    "fxPpl": -400.32,
+    "initialFillDate": "2024-06-07T16:25:02.000+03:00",
+    "frontend": "ANDROID",
+    "maxBuy": 55238.0,
+    "maxSell": 55317.0,
+    "pieQuantity": 0.0
+  },
+  {
+    "ticker": "MA_US_EQ",
+    "quantity": 19.0,
+    "averagePrice": 520.26315789,
+    "currentPrice": 557.5,
+    "ppl": 477.05,
+    "fxPpl": -52.0,
+    "initialFillDate": "2024-06-07T16:25:02.000+03:00",
+    "frontend": "ANDROID",
+    "maxBuy": 23743.0,
+    "maxSell": 23762.0,
+    "pieQuantity": 0.0
+  }
+]
