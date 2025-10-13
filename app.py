@@ -139,7 +139,7 @@ def _gate():
 
     # Fallback: let you manually unlock with a token (no need to redeploy)
     st.markdown("<meta name='robots' content='noindex,nofollow'>", unsafe_allow_html=True)
-    st.title("Private dashboard")
+    st.title("Ozbourne Foreman's Stock Portfolio")
     st.write("This portfolio dashboard is for newsletter subscribers.")
     t = st.text_input("Enter your access token", type="password", placeholder="Paste token from email")
     col1, col2 = st.columns([1,2])
@@ -151,7 +151,7 @@ def _gate():
             else:
                 st.error("Invalid token. Please check your email or subscribe below.")
     with col2:
-        st.link_button("Subscribe to get access", "https://your-newsletter-signup-url", type="primary")
+        st.link_button("Subscribe to get access", "https://inbound.ozbourneforeman.com/holdings", type="primary")
 
     st.stop()
 
