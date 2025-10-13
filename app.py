@@ -49,12 +49,24 @@ try:
 except Exception:
     pass
 
-# --- Fetch helper to refresh local JSONs from T212 API ---
-def fetch_to_file(url: str, out_path: Path):
-    # headers = {"Authorization": f"Apikey {API_KEY}", "Accept": "application/json"}
-    headers = {"Authorization": API_KEY, "Accept": "application/json"} # <-- adjust if your API wants 'Apikey ' or similar
+def fetch_to_file(url: str, out_path: Path, timeout: int = 20):
+    """
+    Cache-first fetch:
+      - If PUBLIC_MODE and a cache exists, return it immediately.
+      - Try network; on success write/update cache and return.
+      - On failure, return existing cache if present; else None.
+    """
+    # 1) Prefer existing cache in public mode (fast + no banner)
+    if PUBLIC_MODE and out_path.exists():
+        try:
+            return json.loads(out_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # 2) Try network
+    headers = {"Authorization": API_KEY, "Accept": "application/json"}  # If your API needs 'Apikey ', change here.
     try:
-        r = requests.get(url, headers=headers, timeout=20)
+        r = requests.get(url, headers=headers, timeout=timeout)
         r.raise_for_status()
         data = r.json()
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +77,14 @@ def fetch_to_file(url: str, out_path: Path):
     except Exception as e:
         if not PUBLIC_MODE:
             st.sidebar.error(f"Fetch failed for {url}: {e}")
-        return None
+
+    # 3) Last resort: use any cache we already have
+    if out_path.exists():
+        try:
+            return json.loads(out_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
 
 API_KEY = os.getenv("T212_API_KEY")
 if not API_KEY:
@@ -298,6 +317,14 @@ for p in [Path("data/portfolio.json"), Path("data/transactions.json"), Path("dat
         st.sidebar.warning(f"{p.name} not found after fetch.")
 
 # Now load from disk (cache-busted by file stats so prices refresh)
+if not DATA.exists() or DATA.stat().st_size < 10:
+    st.error(
+        "portfolio.json missing/empty after fetch. "
+        "On Streamlit Cloud you must either (a) set a valid T212_API_KEY with permissions, "
+        "or (b) commit a sanitized data/portfolio.json to the repo."
+    )
+    st.stop()
+
 _stat = DATA.stat()
 df = load_portfolio((_stat.st_mtime, _stat.st_size))
 
