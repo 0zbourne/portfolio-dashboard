@@ -17,8 +17,14 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-PUBLIC_MODE = os.getenv("PUBLIC_MODE", "0") == "1"
-PUBLIC_TOKEN = os.getenv("PUBLIC_TOKEN", "")  # optional shared secret for ?token=...
+# PUBLIC_MODE can come from env OR secrets; treat "1", "true", "yes" as ON
+def _as_on(x: str) -> bool:
+    return str(x).strip().lower() in {"1", "true", "yes"}
+
+PUBLIC_MODE = _as_on(os.getenv("PUBLIC_MODE", "")) or _as_on(st.secrets.get("PUBLIC_MODE", "0"))
+
+# We are NOT going to use PUBLIC_TOKEN anymore; gating will be via [access].tokens
+PUBLIC_TOKEN = ""   # hard-disable the old gate
 
 def _freshness(path: Path) -> str:
     try:
@@ -26,18 +32,6 @@ def _freshness(path: Path) -> str:
         return ts.strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         return "unknown"
-
-def _public_gate():
-    if PUBLIC_MODE and PUBLIC_TOKEN:
-        try:
-            # New API: no "experimental"
-            tok = str(st.query_params.get("token", "")).strip()
-        except Exception:
-            tok = ""
-        # Exact match; keep it strict
-        if tok != PUBLIC_TOKEN:
-            st.error("Access denied. Missing or invalid token.")
-            st.stop()
 
 # ---- FORCE NUMPY BACKEND (disable Arrow/StrDType) ----
 try:
@@ -104,9 +98,68 @@ BASE = os.getenv("T212_API_BASE", "https://live.trading212.com") # use https://d
 
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 
+# ---------- ACCESS GATE ----------
+import hashlib
+
+def _get_query_param(name: str) -> str | None:
+    try:
+        qp = st.query_params  # Streamlit >=1.37
+        val = qp.get(name)
+        # qp.get returns str|list|None depending on version; normalize to str
+        if isinstance(val, list):
+            return val[0] if val else None
+        return val
+    except Exception:
+        return None
+
+def _access_tokens() -> set[str]:
+    try:
+        # Stored in secrets as: [access] tokens = ["t1","t2",...]
+        toks = st.secrets.get("access", {}).get("tokens", [])
+        return set(str(t).strip() for t in toks if str(t).strip())
+    except Exception:
+        return set()
+
+def _gate():
+    # Only gate when PUBLIC_MODE is on
+    if not PUBLIC_MODE:
+        return
+
+    # Already authenticated this session
+    if st.session_state.get("_authed_ok"):
+        return
+
+    tokens = _access_tokens()
+    supplied = _get_query_param("token")  # e.g., ?token=oz-2025-10
+
+    # If token is valid, let them in for this session
+    if supplied and supplied in tokens:
+        st.session_state["_authed_ok"] = True
+        return
+
+    # Fallback: let you manually unlock with a token (no need to redeploy)
+    st.markdown("<meta name='robots' content='noindex,nofollow'>", unsafe_allow_html=True)
+    st.title("Private dashboard")
+    st.write("This portfolio dashboard is for newsletter subscribers.")
+    t = st.text_input("Enter your access token", type="password", placeholder="Paste token from email")
+    col1, col2 = st.columns([1,2])
+    with col1:
+        if st.button("Unlock"):
+            if t and t in tokens:
+                st.session_state["_authed_ok"] = True
+                st.rerun()
+            else:
+                st.error("Invalid token. Please check your email or subscribe below.")
+    with col2:
+        st.link_button("Subscribe to get access", "https://your-newsletter-signup-url", type="primary")
+
+    st.stop()
+
+_gate()
+# ---------- /ACCESS GATE ----------
+
 if PUBLIC_MODE:
     st.markdown('<meta name="robots" content="noindex,nofollow">', unsafe_allow_html=True)
-_public_gate()
 
 DATA = Path("data") / "portfolio.json"
 
