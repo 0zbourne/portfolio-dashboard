@@ -1013,7 +1013,7 @@ else:
 
     st.caption("Weights by current market value • £ and share counts hidden in public mode.")
     st.dataframe(
-        view_priv.sort_values("Weight %", descending=False if False else True),
+        view_priv.sort_values(by="Weight %", ascending=False, na_position="last"),
         use_container_width=True,
         hide_index=True,
         column_config={
