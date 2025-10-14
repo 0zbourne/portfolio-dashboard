@@ -21,7 +21,15 @@ from pathlib import Path
 def _as_on(x: str) -> bool:
     return str(x).strip().lower() in {"1", "true", "yes"}
 
+# PUBLIC_MODE can come from env OR secrets
 PUBLIC_MODE = _as_on(os.getenv("PUBLIC_MODE", "")) or _as_on(st.secrets.get("PUBLIC_MODE", "0"))
+
+# PRIVACY_MODE: explicit override wins; otherwise mirror PUBLIC_MODE
+PRIVACY_MODE = (
+    _as_on(os.getenv("PRIVACY_MODE", "")) or
+    _as_on(st.secrets.get("PRIVACY_MODE", "")) or
+    PUBLIC_MODE
+)
 
 # We are NOT going to use PUBLIC_TOKEN anymore; gating will be via [access].tokens
 PUBLIC_TOKEN = ""   # hard-disable the old gate
@@ -32,6 +40,22 @@ def _freshness(path: Path) -> str:
         return ts.strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         return "unknown"
+
+def _mask_money(v):
+    return "—" if PRIVACY_MODE else v
+
+def _mask_int(v):
+    return "—" if PRIVACY_MODE else v
+
+# PUBLIC_MODE can come from env OR secrets
+PUBLIC_MODE = _as_on(os.getenv("PUBLIC_MODE", "")) or _as_on(st.secrets.get("PUBLIC_MODE", "0"))
+
+# PRIVACY_MODE: explicit override wins; otherwise mirror PUBLIC_MODE
+PRIVACY_MODE = (
+    _as_on(os.getenv("PRIVACY_MODE", "")) or
+    _as_on(st.secrets.get("PRIVACY_MODE", "")) or
+    PUBLIC_MODE
+)
 
 # ---- FORCE NUMPY BACKEND (disable Arrow/StrDType) ----
 try:
@@ -577,8 +601,8 @@ df["market_value_gbp"] = df["shares"] * df["price_gbp"]
 # KPIs
 c1, c2, c3 = st.columns(3)
 c1.metric("Positions", f"{len(df):,}")
-c2.metric("Total Shares", f"{int(df['shares'].sum()):,}")
-c3.metric("Market Value (GBP)", f"£{df['market_value_gbp'].sum():,.0f}")
+c2.metric("Total Shares", _mask_int(f"{int(df['shares'].sum()):,}"))
+c3.metric("Market Value (GBP)", _mask_money(f"£{df['market_value_gbp'].sum():,.0f}"))
 
 st.caption("GBX handled automatically; USD converted via the sidebar rate.")
 
@@ -790,7 +814,11 @@ else:
 caption = "Weights by current market value"
 if has_cash:
     cash_pct = (cash_gbp / total_with_cash * 100.0) if total_with_cash > 0 else 0.0
-    caption += f" • Cash: £{cash_gbp:,.0f} ({cash_pct:.1f}%) • Source: {cash_src}"
+    caption += (
+        f" • Cash: {cash_pct:.1f}% • Source: {cash_src}"
+        if PRIVACY_MODE
+        else f" • Cash: £{cash_gbp:,.0f} ({cash_pct:.1f}%) • Source: {cash_src}"
+    )
 else:
     caption += " • Cash unavailable (positions only)"
 st.caption(caption + ".")
@@ -926,42 +954,77 @@ for c in num_cols:
     if c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-view = df[[
-    "company",
-    "shares",
-    "ccy",
-    "price_native",
-    "avg_cost_native",
-    "day_change_gbp",
-    "day_change_pct",
-    "total_return_gbp",
-    "total_return_pct",
-    "dividends_gbp",
-    "capital_gains_gbp",
-    "total_value_gbp",   # <— add this
-    "weight_pct",
-]].copy()
+if not PRIVACY_MODE:
+    view = df[[
+        "company",
+        "shares",
+        "ccy",
+        "price_native",
+        "avg_cost_native",
+        "day_change_gbp",
+        "day_change_pct",
+        "total_return_gbp",
+        "total_return_pct",
+        "dividends_gbp",
+        "capital_gains_gbp",
+        "total_value_gbp",
+        "weight_pct",
+    ]].copy()
 
-st.dataframe(
-    view.sort_values("total_value_gbp", ascending=False),
-    use_container_width=True,
-    hide_index=True,
-    column_config={
+    st.dataframe(
+        view.sort_values("total_value_gbp", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "company": "Name",
+            "shares": st.column_config.NumberColumn("No. of Shares", format="%.0f"),
+            "ccy": st.column_config.TextColumn("Ccy"),
+            "price_native":    st.column_config.NumberColumn("Live Share Price",  format="%.2f"),
+            "avg_cost_native": st.column_config.NumberColumn("Avg. Share Price",  format="%.2f"),
+            "day_change_gbp":  st.column_config.NumberColumn("Day Change £",      format="£%.0f"),
+            "day_change_pct":  st.column_config.NumberColumn("Day Change %",      format="%.2f%%"),
+            "total_return_gbp":st.column_config.NumberColumn("Total Return £",    format="£%.0f"),
+            "total_return_pct":st.column_config.NumberColumn("Total Return %",    format="%.2f%%"),
+            "dividends_gbp":   st.column_config.NumberColumn("Dividends",         format="£%.0f"),
+            "capital_gains_gbp": st.column_config.NumberColumn("Capital Gains",   format="£%.0f"),
+            "total_value_gbp": st.column_config.NumberColumn("Holding Value",     format="£%.0f"),
+            "weight_pct":      st.column_config.NumberColumn("Weight %",          format="%.2f%%"),
+        },
+    )
+else:
+    # Privacy view: show only % metrics + weights (no £, no shares)
+    view_priv = df[[
+        "company",
+        "ccy",
+        "day_change_pct",
+        "total_return_pct",
+        "pl_pct_native",
+        "weight_pct",
+    ]].copy()
+
+    view_priv.rename(columns={
         "company": "Name",
-        "shares": st.column_config.NumberColumn("No. of Shares", format="%.0f"),
-        "ccy": st.column_config.TextColumn("Ccy"),
-        "price_native":    st.column_config.NumberColumn("Live Share Price",  format="%.2f"),
-        "avg_cost_native": st.column_config.NumberColumn("Avg. Share Price",  format="%.2f"),
-        "day_change_gbp":  st.column_config.NumberColumn("Day Change £",      format="£%.0f"),
-        "day_change_pct":  st.column_config.NumberColumn("Day Change %",      format="%.2f%%"),
-        "total_return_gbp":st.column_config.NumberColumn("Total Return £",    format="£%.0f"),
-        "total_return_pct":st.column_config.NumberColumn("Total Return %",    format="%.2f%%"),
-        "dividends_gbp":   st.column_config.NumberColumn("Dividends",         format="£%.0f"),
-        "capital_gains_gbp": st.column_config.NumberColumn("Capital Gains",   format="£%.0f"),
-        "total_value_gbp": st.column_config.NumberColumn("Holding Value", format="£%.0f"),
-        "weight_pct":      st.column_config.NumberColumn("Weight %",          format="%.2f%%"),
-    },
-)
+        "ccy": "Ccy",
+        "day_change_pct": "Day Change %",
+        "total_return_pct": "Total Return %",
+        "pl_pct_native": "P/L % (native)",
+        "weight_pct": "Weight %",
+    }, inplace=True)
+
+    st.caption("Weights by current market value • £ and share counts hidden in public mode.")
+    st.dataframe(
+        view_priv.sort_values("Weight %", descending=False if False else True),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Name": st.column_config.TextColumn("Name"),
+            "Ccy": st.column_config.TextColumn("Ccy"),
+            "Day Change %": st.column_config.NumberColumn("Day Change %", format="%.2f%%"),
+            "Total Return %": st.column_config.NumberColumn("Total Return %", format="%.2f%%"),
+            "P/L % (native)": st.column_config.NumberColumn("P/L % (native)", format="%.2f%%"),
+            "Weight %": st.column_config.NumberColumn("Weight %", format="%.2f%%"),
+        },
+    )
 
 # Helpful notes for what’s estimated/missing
 notes = []
