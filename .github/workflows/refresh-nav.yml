@@ -32,6 +32,7 @@ jobs:
           T212_API_KEY: ${{ secrets.T212_API_KEY }}
           NAV_ANCHOR:   ${{ secrets.NAV_ANCHOR }}
           T212_API_BASE: "https://live.trading212.com"
+          PYTHONPATH:   ${{ github.workspace }}
         run: |
           set -euo pipefail
           echo "Starting backfill with NAV_ANCHOR='${NAV_ANCHOR:-2025-01-01}'"
