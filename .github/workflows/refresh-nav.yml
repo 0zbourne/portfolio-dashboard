@@ -1,62 +1,64 @@
 name: Refresh NAV (daily)
 
 on:
-  schedule:
-    - cron: '30 6 * * 1-5'   # 06:30 UTC, weekdays
   workflow_dispatch: {}
-
-permissions:
-  contents: write
-
-concurrency:
-  group: refresh-nav
-  cancel-in-progress: true
+  schedule:
+    - cron: "7 4 * * *"     # 04:07 UTC daily
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      TZ: UTC
-      NAV_ANCHOR: "2025-01-01"
-      T212_API_KEY: ${{ secrets.T212_API_KEY }}
-      PYTHONPATH: ${{ github.workspace }}
-
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Refresh NAV
+        id: refresh
+        env:
+          # <-- pass secrets straight into your code
+          T212_API_KEY: ${{ secrets.T212_API_KEY }}
+          NAV_ANCHOR:   ${{ secrets.NAV_ANCHOR }}
+          T212_API_BASE: "https://live.trading212.com"
         run: |
+          set -euo pipefail
+          echo "Starting backfill with NAV_ANCHOR='${NAV_ANCHOR:-2025-01-01}'"
           python tools/refresh_nav.py
+          echo "OUT_PATH=$(ls -1 data/nav_daily.csv)" >> $GITHUB_OUTPUT
+
+      - name: Show backfill trace (if present)
+        if: failure() || always()
+        run: |
+          if [ -f data/_backfill_trace.txt ]; then
+            echo "----- data/_backfill_trace.txt -----"
+            cat data/_backfill_trace.txt
+            echo "------------------------------------"
+          else
+            echo "No _backfill_trace.txt written."
+          fi
 
       - name: Commit & push if changed
+        if: success()
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet -- data/nav_daily.csv; then
-            git add data/nav_daily.csv
-            git commit -m "ci: refresh NAV $(date -u +'%Y-%m-%d')"
+          git add data/nav_daily.csv data/backfill_report.json || true
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: update nav_daily.csv ($(date -u +'%Y-%m-%d'))"
             git push
           else
-            echo "No changes in data/nav_daily.csv; skipping commit."
+            echo "No changes to commit."
           fi
+
