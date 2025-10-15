@@ -19,6 +19,7 @@ jobs:
       TZ: UTC
       NAV_ANCHOR: "2025-01-01"
       T212_API_KEY: ${{ secrets.T212_API_KEY }}
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Checkout
