@@ -28,14 +28,15 @@ jobs:
       - name: Refresh NAV
         id: refresh
         env:
-          # <-- pass secrets straight into your code
           T212_API_KEY: ${{ secrets.T212_API_KEY }}
-          NAV_ANCHOR:   ${{ secrets.NAV_ANCHOR }}
+          NAV_ANCHOR:   ${{ secrets.NAV_ANCHOR || '2025-01-01' }}  # <-- default here
           T212_API_BASE: "https://live.trading212.com"
           PYTHONPATH:   ${{ github.workspace }}
         run: |
           set -euo pipefail
-          echo "Starting backfill with NAV_ANCHOR='${NAV_ANCHOR:-2025-01-01}'"
+          # Normalise NAV_ANCHOR into the environment in case a different shell is used
+          export NAV_ANCHOR="${NAV_ANCHOR:-2025-01-01}"
+          echo "Starting backfill with NAV_ANCHOR='${NAV_ANCHOR}'"
           python tools/refresh_nav.py
           echo "OUT_PATH=$(ls -1 data/nav_daily.csv)" >> $GITHUB_OUTPUT
 
