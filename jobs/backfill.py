@@ -76,7 +76,7 @@ def _paged_get(url: str):
         # T212 returns absolute path; join with base
         next_url = API_BASE.rstrip("/") + next_path
         # be polite
-        time.sleep(0.2)
+        time.sleep(2.1)
     return items
 
 # ---------------------------
@@ -310,30 +310,37 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         if "status" in o.columns:
             o = o[o["status"].astype(str).str.upper().eq("FILLED")]
 
-        # pick a usable timestamp column
-        time_candidates = ["filledAt","updatedAt","lastUpdated","placedAt","dateTime","dateModified","dateCreated"]
-        time_col = next((c for c in time_candidates if c in o.columns), None)
+        # --- NEW: handle Trading212's nested schema (order.* / fill.*) ---
+        # Status column can be "status" (old) or "order.status" (new)
+        status_col = next((c for c in ["status", "order.status"] if c in o.columns), None)
+        if status_col:
+            o = o[o[status_col].astype(str).str.upper().eq("FILLED")]
+
+        # Prefer fill-level timestamp if present (matches fill qty/price)
+        time_col = next((c for c in ["fill.filledAt", "filledAt", "order.filledAt", "order.createdAt"] if c in o.columns), None)
+        # Fallback: anything ending in ".filledAt" or ending in "filledAt"
+        if time_col is None:
+            time_col = next((c for c in o.columns if str(c).endswith(".filledAt") or str(c).endswith("filledAt")), None)
         if time_col is None:
             raise RuntimeError(f"Could not find a fill timestamp column. Columns: {list(o.columns)}")
 
-        need_cols = ["ticker", "filledQuantity", time_col]
-        missing = [c for c in need_cols if c not in o.columns]
-        if missing:
-            raise RuntimeError(f"Orders payload missing columns: {missing}")
+        ticker_col = next((c for c in ["order.ticker", "order.instrument.ticker", "ticker"] if c in o.columns), None)
+        if ticker_col is None:
+            raise RuntimeError(f"Could not find a ticker column. Columns: {list(o.columns)}")
 
-        # unify ts -> filledAt (date)
-        w = o[need_cols].copy().rename(columns={time_col: "filledAt"})
-        if pd.api.types.is_numeric_dtype(w["filledAt"]):
-            dt = pd.to_datetime(w["filledAt"], unit="ms", errors="coerce", utc=True)
-        else:
-            dt = pd.to_datetime(w["filledAt"].astype(str), errors="coerce", utc=True)
-        w["filledAt"] = dt.dt.date
+        qty_col = next((c for c in ["fill.quantity", "order.filledQuantity", "filledQuantity"] if c in o.columns), None)
+        if qty_col is None:
+            raise RuntimeError(f"Could not find a filled quantity column. Columns: {list(o.columns)}")
 
-        # infer side if present; otherwise default BUY
-        side = o.get("side")
-        if side is None:
-            side = pd.Series("BUY", index=o.index)
-        w["side"] = side
+        side_col = next((c for c in ["order.side", "side"] if c in o.columns), None)
+
+        # Build canonical dataframe expected by downstream functions
+        w = pd.DataFrame({
+            "ticker": o[ticker_col],
+            "filledQuantity": o[qty_col],
+            "filledAt": o[time_col],
+            "side": o[side_col] if side_col else "BUY",
+        })
 
         # 2) Build positions timeseries (float64 matrix)
         pos = _build_position_timeseries(w[["ticker","side","filledQuantity","filledAt"]], d0, d1)
