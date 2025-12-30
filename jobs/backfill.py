@@ -8,8 +8,20 @@ import requests
 import numpy as np
 
 def _t212_headers():
+    """
+    New Trading212 auth: Basic base64(KEY:SECRET)
+    Legacy fallback kept for backwards compatibility.
+    """
     key = os.getenv("T212_API_KEY", "").strip()
-    # allow either "abc..." or "Apikey abc..."
+    secret = os.getenv("T212_API_SECRET", "").strip()
+
+    # Preferred: Basic auth (key + secret)
+    if key and secret:
+        import base64
+        token = base64.b64encode(f"{key}:{secret}".encode("utf-8")).decode("ascii")
+        return {"Authorization": f"Basic {token}", "Accept": "application/json"}
+
+    # Legacy fallback: Apikey <key>
     if key and not key.lower().startswith("apikey "):
         key = f"Apikey {key}"
     return {"Authorization": key, "Accept": "application/json"}

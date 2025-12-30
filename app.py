@@ -104,19 +104,27 @@ def fetch_to_file(url: str, out_path: Path, timeout: int = 20):
             return None
     return None
 
-API_KEY = os.getenv("T212_API_KEY")
-if not PUBLIC_MODE and not API_KEY:
-    st.error("Missing T212 API key — set it with setx T212_API_KEY ...")
-    st.stop()
-
 def _auth_header() -> dict:
-    """Return Trading212 Authorization header with the correct 'Apikey ' prefix."""
-    key = os.getenv("T212_API_KEY", "") or ""
-    if not key:
-        return {}
-    if key.lower().startswith("apikey "):
-        return {"Authorization": key, "Accept": "application/json"}
-    return {"Authorization": f"Apikey {key}", "Accept": "application/json"}
+    """
+    New Trading212 auth: Basic base64(KEY:SECRET).
+    Legacy fallback kept for backwards compatibility.
+    """
+    key = (os.getenv("T212_API_KEY") or "").strip() or str(st.secrets.get("T212_API_KEY", "")).strip()
+    secret = (os.getenv("T212_API_SECRET") or "").strip() or str(st.secrets.get("T212_API_SECRET", "")).strip()
+
+    # Preferred: Basic auth
+    if key and secret:
+        import base64
+        token = base64.b64encode(f"{key}:{secret}".encode("utf-8")).decode("ascii")
+        return {"Authorization": f"Basic {token}", "Accept": "application/json"}
+
+    # Legacy fallback: Apikey <key>
+    if key:
+        if key.lower().startswith("apikey "):
+            return {"Authorization": key, "Accept": "application/json"}
+        return {"Authorization": f"Apikey {key}", "Accept": "application/json"}
+
+    return {}
 
 BASE = os.getenv("T212_API_BASE", "https://live.trading212.com") # use https://demo.trading212.com for practice  # practice API host
 

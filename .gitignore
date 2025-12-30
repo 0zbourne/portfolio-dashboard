@@ -24,3 +24,5 @@ data/*
 # Bench data
 bench/*
 !bench/sp500_daily.csv
+# Local Streamlit secrets
+.streamlit/secrets.toml
