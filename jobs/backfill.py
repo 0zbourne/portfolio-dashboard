@@ -190,25 +190,59 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
     gbp_syms = [t for t,(y,ccy) in yf_map.items() if y and ccy == "GBP"]
     usd_syms = [t for t,(y,ccy) in yf_map.items() if y and ccy == "USD"]
 
-    def _dl(symbols: list[str]) -> pd.DataFrame:
-        if not symbols:
-            return pd.DataFrame()
-        ysyms = [yf_map[t][0] for t in symbols]
-        df = yf.download(
-            ysyms,
-            start=str(start),
-            end=str(end + timedelta(days=1)),
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-        )["Close"]
-        if isinstance(df, pd.Series):
-            df = df.to_frame()
-        df.index = pd.to_datetime(df.index).date
-        # coerce every column to float64 (strings -> NaN)
-        for c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
-        return df.reindex(cal_idx)
+def _dl(symbols: list[str]) -> pd.DataFrame:
+    """
+    Yahoo is rate-limited (429) easily. Do one batch download, no threads,
+    and back off automatically if Yahoo blocks.
+    """
+    if not symbols:
+        return pd.DataFrame()
+
+    ysyms = [yf_map[t][0] for t in symbols]
+
+    last_err: Exception | None = None
+    # backoff schedule: 2s, 5s, 10s, 20s, 40s
+    for sleep_s in (0, 2, 5, 10, 20, 40):
+        if sleep_s:
+            time.sleep(sleep_s)
+
+        try:
+            df = yf.download(
+                ysyms,
+                start=str(start),
+                end=str(end + timedelta(days=1)),
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,   # IMPORTANT: reduce rate-limit risk
+            )
+
+            # yfinance returns a multiindex columns df; we only want Close
+            close = df["Close"] if isinstance(df, pd.DataFrame) and "Close" in df else df
+            if isinstance(close, pd.Series):
+                close = close.to_frame()
+
+            # If Yahoo blocked us, close can be empty
+            if close is None or close.empty:
+                continue
+
+            close.index = pd.to_datetime(close.index).date
+
+            for c in close.columns:
+                close[c] = pd.to_numeric(close[c], errors="coerce").astype("float64")
+
+            return close.reindex(cal_idx)
+
+        except Exception as e:
+            last_err = e
+            continue
+
+    # If we get here, Yahoo never gave us usable data
+    raise RuntimeError(
+        "Yahoo download failed (likely HTTP 429 rate limit). "
+        "Change IP (VPN exit) or wait, then retry."
+    ) from last_err
+
     # download by currency
     gbp_px = _dl(gbp_syms)
     usd_px = _dl(usd_syms)
@@ -224,17 +258,11 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
         ser = gbp_px.get(ysym)
         if ser is None or ser.dropna().empty:
             missing.append(t); continue
-        # --- robust unit check using yfinance metadata ---
-        try:
-            info = yf.Ticker(ysym).info
-            if info.get("currency") == "GBp":
-                # yfinance reports in pence → convert to pounds
-                ser = ser / 100.0
-        except Exception:
-            # fallback heuristic if metadata is unavailable
-            med = float(ser.dropna().median()) if ser.notna().any() else None
-            if med and med > 1000.0:
-                ser = ser / 100.0
+        # Heuristic only (avoid per-ticker network calls that trigger 429)
+        med = float(ser.dropna().median()) if ser.notna().any() else None
+        if med and med > 1000.0:
+            # many LSE listings are returned in pence → convert to pounds
+            ser = ser / 100.0
 
         out[t] = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
 
