@@ -4,3 +4,4 @@ numpy
 altair
 requests
 yfinance
+yfinance>=0.2.40
