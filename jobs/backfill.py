@@ -348,19 +348,21 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         pos = _build_position_timeseries(w[["ticker","side","filledQuantity","filledAt"]], d0, d1)
 
         # 3) Map tickers to yfinance & currencies
-        overrides = _load_overrides()
-        mapping: dict[str, tuple[str,str]] = {}
-        for t in pos.columns:
-            ysym, ccy = _infer_yf_symbol(t, overrides)
-            mapping[t] = (ysym, ccy)
-
-        overrides = _load_overrides()
-
-        # Write to a debug file
-        (DATA_DIR / "_overrides_debug.txt").write_text(
-            f"Loaded {len(overrides)} overrides:\n{json.dumps(overrides, indent=2)}",
-            encoding="utf-8"
-        )
+        def _load_overrides() -> dict:
+            # Hardcoded overrides (file loading unreliable on Streamlit Cloud)
+            hardcoded = {
+                "LSEl_EQ": {"yf": "LSEG.L", "ccy": "GBP"},
+                "AHTL_EQ": {"yf": "AHT.L", "ccy": "GBP"},
+                "HLMA_EQUITY": {"yf": "HLMA.L", "ccy": "GBP"},
+            }
+            
+            if OVERRIDES_PATH.exists():
+                try:
+                    file_overrides = json.loads(OVERRIDES_PATH.read_text(encoding="utf-8"))
+                    hardcoded.update(file_overrides)
+                except Exception:
+                    pass
+            return hardcoded
 
         # 4) Download prices
         prices, miss = _download_prices(mapping, d0, d1)
