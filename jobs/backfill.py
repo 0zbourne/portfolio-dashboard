@@ -2,7 +2,7 @@
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime, timedelta, date, timezone
-import os, json, math, time
+import os, json, time
 import pandas as pd
 import requests
 import numpy as np
@@ -42,10 +42,12 @@ NAV_CSV = DATA_DIR / "nav_daily.csv"
 REPORT = DATA_DIR / "backfill_report.json"
 OVERRIDES_PATH = DATA_DIR / "ticker_overrides.json"
 
+
 def _auth_headers():
     if not API_KEY:
         raise RuntimeError("Missing T212_API_KEY in environment.")
     return {"Authorization": API_KEY, "Accept": "application/json"}
+
 
 def _paged_get(url: str):
     items = []
@@ -64,11 +66,17 @@ def _paged_get(url: str):
         time.sleep(2.1)
     return items
 
+
 def _load_overrides() -> dict:
+    """
+    Load ticker overrides. Currency should be:
+    - "GBX" for UK stocks (yfinance returns PENCE)
+    - "USD" for US stocks
+    """
     hardcoded = {
-        "LSEl_EQ": {"yf": "LSEG.L", "ccy": "GBP"},
-        "AHTL_EQ": {"yf": "AHT.L", "ccy": "GBP"},
-        "HLMA_EQUITY": {"yf": "HLMA.L", "ccy": "GBP"},
+        "LSEl_EQ": {"yf": "LSEG.L", "ccy": "GBX"},
+        "AHTL_EQ": {"yf": "AHT.L", "ccy": "GBX"},
+        "HLMA_EQUITY": {"yf": "HLMA.L", "ccy": "GBX"},
     }
     if OVERRIDES_PATH.exists():
         try:
@@ -78,31 +86,45 @@ def _load_overrides() -> dict:
             pass
     return hardcoded
 
+
 def _infer_yf_symbol(t212_ticker: str, overrides: dict) -> tuple[str | None, str]:
+    """
+    Map Trading212 ticker to yfinance symbol and currency.
+    
+    Returns:
+        (yfinance_symbol, currency) where currency is:
+        - "GBX" for London stocks (yfinance returns PENCE)
+        - "USD" for US stocks
+    """
     t = (t212_ticker or "").strip().upper()
     overrides_upper = {k.upper(): v for k, v in overrides.items()}
 
+    # Check overrides first
     if t in overrides_upper:
         v = overrides_upper[t]
         if isinstance(v, dict):
-            return v.get("yf"), v.get("ccy", "GBP")
+            return v.get("yf"), v.get("ccy", "GBX")
         if isinstance(v, str):
-            return v, "GBP"
+            return v, "GBX"
 
+    # US stocks - return USD
     if "_US_" in t:
         core = t.split("_")[0]
         return core, "USD"
 
+    # UK stocks - yfinance returns PENCE for .L tickers
     core = t.replace("_GBX", "").replace("_GB", "").replace("_EQ", "")
     core = core.split("_")[0]
 
+    # Strip trailing 'L' if ticker looks like "RMVL" -> "RMV"
     if core.endswith("L") and len(core) >= 4:
         core = core[:-1]
 
     if core and core.isalpha() and 1 <= len(core) <= 5:
-        return f"{core}.L", "GBP"
+        return f"{core}.L", "GBX"
 
     return None, None
+
 
 def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     if orders.empty:
@@ -127,21 +149,25 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
     mat = pd.DataFrame(0.0, index=idx, columns=tickers, dtype="float64")
 
     for _, r in daily.iterrows():
-        d = r["date"]; tk = r["ticker"]; q = float(r["signed_qty"])
+        d = r["date"]
+        tk = r["ticker"]
+        q = float(r["signed_qty"])
         mat.loc[mat.index >= d, tk] += q
 
     mat = mat.loc[:, (mat != 0).any(axis=0)].astype("float64")
     return mat
 
+
 def _download_fx_usd_gbp(start: date, end: date) -> pd.Series:
+    """Fetch USD to GBP exchange rate from Frankfurter API."""
     url = f"https://api.frankfurter.app/{start}..{end}"
     
     for attempt in range(3):
         try:
-            r = requests.get(url, params={"from":"USD","to":"GBP"}, timeout=30)
+            r = requests.get(url, params={"from": "USD", "to": "GBP"}, timeout=30)
             r.raise_for_status()
             data = r.json().get("rates", {})
-            fx = pd.DataFrame.from_dict(data, orient="index").rename(columns={"GBP":"usd_gbp"})
+            fx = pd.DataFrame.from_dict(data, orient="index").rename(columns={"GBP": "usd_gbp"})
             fx.index = pd.to_datetime(fx.index).date
             return fx["usd_gbp"]
         except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
@@ -150,7 +176,23 @@ def _download_fx_usd_gbp(start: date, end: date) -> pd.Series:
                 continue
             raise RuntimeError(f"FX API unavailable after 3 attempts: {e}") from e
 
-def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) -> tuple[pd.DataFrame, list[str]]:
+
+def _download_prices(yf_map: dict[str, tuple[str, str]], start: date, end: date) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Download historical prices from yfinance and convert to GBP.
+    
+    Key insight: yfinance returns PENCE for UK stocks (.L), not pounds.
+    We explicitly divide by 100 based on currency flag, NOT price threshold.
+    
+    Args:
+        yf_map: Dict mapping T212 ticker -> (yfinance symbol, currency)
+                currency should be "GBX" or "USD"
+        start: Start date
+        end: End date
+    
+    Returns:
+        (prices_df, missing_symbols) where prices are in GBP
+    """
     missing: list[str] = []
     cal_idx = pd.date_range(start, end, freq="D").date
     out = pd.DataFrame(index=cal_idx, dtype="float64")
@@ -158,10 +200,12 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
     if yf is None:
         raise RuntimeError("yfinance is not installed.")
 
-    gbp_syms = [t for t,(y,ccy) in yf_map.items() if y and ccy == "GBP"]
-    usd_syms = [t for t,(y,ccy) in yf_map.items() if y and ccy == "USD"]
+    # Separate by currency - GBX means yfinance returns PENCE
+    gbx_syms = [t for t, (y, ccy) in yf_map.items() if y and ccy == "GBX"]
+    usd_syms = [t for t, (y, ccy) in yf_map.items() if y and ccy == "USD"]
 
     def _dl(symbols: list[str]) -> pd.DataFrame:
+        """Download prices from yfinance with retries."""
         if not symbols:
             return pd.DataFrame()
 
@@ -190,7 +234,6 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
                 if close is None or close.empty:
                     continue
 
-                # FIX: Explicitly copy to avoid SettingWithCopyWarning
                 close = close.copy()
                 close.index = pd.to_datetime(close.index).date
 
@@ -205,25 +248,29 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
 
         raise RuntimeError(f"Yahoo download failed: {last_err}") from last_err
 
-    gbp_px = _dl(gbp_syms)
+    # Download prices for each currency group
+    gbx_px = _dl(gbx_syms)
     usd_px = _dl(usd_syms)
 
-    fx = _download_fx_usd_gbp(start, end) if not usd_px.empty else pd.Series(dtype="float64")
+    # Fetch FX rates for USD conversion
+    fx = _download_fx_usd_gbp(start, end) if usd_syms else pd.Series(dtype="float64")
     fx = pd.to_numeric(fx, errors="coerce").astype("float64").reindex(cal_idx)
     fx_np = fx.to_numpy(dtype=np.float64, na_value=np.nan) if not fx.empty else None
 
-    for t in gbp_syms:
+    # Process GBX stocks - yfinance returns PENCE, ALWAYS divide by 100
+    # NO THRESHOLD GUESSING - we know the currency from the ticker
+    for t in gbx_syms:
         ysym = yf_map[t][0]
-        ser = gbp_px.get(ysym)
+        ser = gbx_px.get(ysym)
         if ser is None or ser.dropna().empty:
             missing.append(t)
             continue
-        med = float(ser.dropna().median()) if ser.notna().any() else None
-        if med and med > 1000.0:
-            ser = ser / 100.0
+        # Convert pence to pounds - deterministic, not heuristic
+        ser = ser / 100.0
         out.loc[:, t] = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
 
-    if not usd_px.empty and fx_np is not None:
+    # Process USD stocks - convert to GBP via FX rate
+    if usd_syms and fx_np is not None:
         for t in usd_syms:
             ysym = yf_map[t][0]
             ser = usd_px.get(ysym)
@@ -239,7 +286,14 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
 
     return out, missing
 
+
 def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) -> Path:
+    """
+    Rebuild daily NAV from Trading212 order history.
+    
+    Fetches all filled orders, builds position timeseries, downloads
+    historical prices, and calculates daily portfolio value in GBP.
+    """
     import traceback
 
     trace_path = DATA_DIR / "_backfill_trace.txt"
@@ -268,6 +322,7 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         d0 = datetime.strptime(start, "%Y-%m-%d").date()
         d1 = datetime.strptime(end, "%Y-%m-%d").date() if end else datetime.now(timezone.utc).date()
 
+        # Fetch all orders from T212
         fetch_from = "1970-01-01"
         url = f"{API_BASE}/api/v0/equity/history/orders?from={fetch_from}&to={d1}"
         items = _paged_get(url)
@@ -276,10 +331,12 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
 
         o = pd.json_normalize(items)
 
+        # Filter to filled orders only
         status_col = next((c for c in ["status", "order.status"] if c in o.columns), None)
         if status_col:
             o = o[o[status_col].astype(str).str.upper().eq("FILLED")]
 
+        # Find required columns
         time_col = next((c for c in ["fill.filledAt", "filledAt", "order.filledAt", "order.createdAt"] if c in o.columns), None)
         if time_col is None:
             time_col = next((c for c in o.columns if str(c).endswith(".filledAt") or str(c).endswith("filledAt")), None)
@@ -303,26 +360,32 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
             "side": o[side_col] if side_col else "BUY",
         })
 
-        pos = _build_position_timeseries(w[["ticker","side","filledQuantity","filledAt"]], d0, d1)
+        # Build position timeseries
+        pos = _build_position_timeseries(w[["ticker", "side", "filledQuantity", "filledAt"]], d0, d1)
 
+        # Map T212 tickers to yfinance symbols
         overrides = _load_overrides()
-        mapping: dict[str, tuple[str,str]] = {}
+        mapping: dict[str, tuple[str, str]] = {}
         for t in pos.columns:
             ysym, ccy = _infer_yf_symbol(t, overrides)
             mapping[t] = (ysym, ccy)
 
+        # Download prices
         prices, miss = _download_prices(mapping, d0, d1)
 
+        # Align positions and prices
         keep = [t for t in pos.columns if t in prices.columns]
         if not keep:
             raise RuntimeError("No overlapping tickers between positions and prices.")
         pos = pos[keep]
         prices = prices[keep]
 
+        # Forward fill missing prices
         full_idx = pd.date_range(d0, d1, freq="D").date
         prices = prices.sort_index().reindex(full_idx).ffill().astype("float64")
         pos = pos.sort_index().reindex(full_idx).ffill().fillna(0.0).astype("float64")
 
+        # Calculate NAV
         pos_np = pos.to_numpy(dtype=np.float64, na_value=np.nan)
         prices_np = prices.to_numpy(dtype=np.float64, na_value=np.nan)
         nav_vals = np.nansum(pos_np * prices_np, axis=1)
@@ -334,6 +397,7 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         NAV_CSV.parent.mkdir(parents=True, exist_ok=True)
         nav.to_csv(NAV_CSV, index=False)
 
+        # Write report
         REPORT.write_text(json.dumps({"missing_symbols": miss, "mapped": mapping}, indent=2), encoding="utf-8")
         return NAV_CSV
 
