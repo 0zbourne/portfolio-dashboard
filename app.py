@@ -78,6 +78,9 @@ st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 DATA = Path("data") / "portfolio.json"
 OPEN_FILE = Path("data") / "open_prices.json"
 ACC_FILE = Path("data") / "account.json"
+NAV_CSV = Path("data") / "nav_daily.csv"
+REPORT = Path("data") / "backfill_report.json"
+OVERRIDES_PATH = Path("data") / "ticker_overrides.json"
 
 def _load_open_prices():
     if OPEN_FILE.exists():
@@ -839,9 +842,6 @@ from pdperf.series import read_nav, daily_returns_twr, cumulative_return, cagr
 from pdperf.cashflows import build_cash_flows
 from bench.sp500 import get_sp500_daily
 
-NAV_CSV = Path("data") / "nav_daily.csv"
-REPORT = Path("data") / "backfill_report.json"
-
 try:
     append_today_snapshot_if_missing(df)
 except Exception as e:
@@ -893,7 +893,7 @@ try:
         plot["S&P 500 (GBP)"] = (100.0 * (1.0 + plot["r_bench"]).cumprod()).astype("float64")
 
         st.subheader("NAV vs S&P 500 (rebased to 100)")
-        st.caption(f"As of { _freshness(Path('data') / 'nav_daily.csv') }")
+        st.caption(f"As of { _freshness(NAV_CSV) }")
 
         plot_alt = plot.copy()
         plot_alt["date"] = pd.to_datetime(plot_alt["date"], errors="coerce")
@@ -931,7 +931,7 @@ try:
 
 except Exception as e:
     st.sidebar.info(f"Perf debug unavailable: {e}")
-    
+
     # Debug section - show file contents
     with st.expander("Debug: Data Files", expanded=False):
         st.subheader("nav_daily.csv")
@@ -944,14 +944,14 @@ except Exception as e:
             st.dataframe(nav_debug.tail(5), width="stretch")
         else:
             st.write("File not found")
-        
+
         st.subheader("backfill_report.json")
         if REPORT.exists():
             report_debug = json.loads(REPORT.read_text(encoding="utf-8"))
             st.json(report_debug)
         else:
             st.write("File not found")
-        
+
         st.subheader("portfolio.json (first 2 items)")
         if DATA.exists():
             port_debug = json.loads(DATA.read_text(encoding="utf-8"))
@@ -961,3 +961,73 @@ except Exception as e:
                 st.json(port_debug)
         else:
             st.write("File not found")
+
+# =======================
+# Debug: Export data files
+# =======================
+with st.sidebar.expander("🔧 Debug: Export Data", expanded=False):
+    st.markdown("### Data Files")
+
+    # nav_daily.csv
+    if NAV_CSV.exists():
+        nav_data = NAV_CSV.read_text(encoding="utf-8")
+        st.download_button(
+            label="📥 Download nav_daily.csv",
+            data=nav_data,
+            file_name="nav_daily.csv",
+            mime="text/csv",
+        )
+        st.caption(f"Rows: {len(nav_data.splitlines()) - 1}")
+    else:
+        st.write("nav_daily.csv not found")
+
+    # transactions.json
+    tx_path = Path("data") / "transactions.json"
+    if tx_path.exists():
+        tx_data = tx_path.read_text(encoding="utf-8")
+        st.download_button(
+            label="📥 Download transactions.json",
+            data=tx_data,
+            file_name="transactions.json",
+            mime="application/json",
+        )
+        st.caption(f"Size: {len(tx_data):,} bytes")
+    else:
+        st.write("transactions.json not found")
+
+    # backfill_report.json
+    if REPORT.exists():
+        rep_data = REPORT.read_text(encoding="utf-8")
+        st.download_button(
+            label="📥 Download backfill_report.json",
+            data=rep_data,
+            file_name="backfill_report.json",
+            mime="application/json",
+        )
+    else:
+        st.write("backfill_report.json not found")
+
+    # ticker_overrides.json
+    if OVERRIDES_PATH.exists():
+        ov_data = OVERRIDES_PATH.read_text(encoding="utf-8")
+        st.download_button(
+            label="📥 Download ticker_overrides.json",
+            data=ov_data,
+            file_name="ticker_overrides.json",
+            mime="application/json",
+        )
+    else:
+        st.write("ticker_overrides.json not found")
+
+    st.markdown("---")
+    st.markdown("### Inspect NAV around Feb 2025")
+
+    if NAV_CSV.exists():
+        nav_df = pd.read_csv(NAV_CSV)
+        nav_df["date"] = pd.to_datetime(nav_df["date"])
+        feb_slice = nav_df[(nav_df["date"] >= "2025-02-20") & (nav_df["date"] <= "2025-02-28")]
+        if not feb_slice.empty:
+            st.dataframe(feb_slice, width="stretch", hide_index=True)
+            st.caption(f"NAV range: £{feb_slice['nav_gbp'].min():,.0f} - £{feb_slice['nav_gbp'].max():,.0f}")
+        else:
+            st.write("No data for Feb 2025")
