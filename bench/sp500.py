@@ -1,32 +1,30 @@
 from pathlib import Path
-from io import StringIO
 import pandas as pd
-import requests
+import yfinance as yf
 
 DATA_DIR = Path("data")
 SP500_CSV = DATA_DIR / "sp500_daily.csv"
 
-def _fetch_spy_stooq():
+def _fetch_spy_yfinance():
     """
-    Free daily SPY prices (USD) from Stooq (Close; price-only proxy).
+    Free daily SPY prices (USD) from Yahoo Finance.
     """
-    url = "https://stooq.com/q/d/l/?s=spy.us&i=d"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    df = pd.read_csv(StringIO(r.text))
-    df.rename(columns=str.lower, inplace=True)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date", "close"]).rename(columns={"close": "close_usd"})
+    ticker = yf.Ticker("SPY")
+    df = ticker.history(period="max", auto_adjust=True)
+    df = df.reset_index()
+    df["date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    df = df.rename(columns={"Close": "close_usd"})
     return df[["date", "close_usd"]]
 
 def _fetch_fx_usd_gbp(start, end):
     """
     Daily USD->GBP from ECB via frankfurter.app for [start, end].
     """
+    import requests
     url = f"https://api.frankfurter.app/{start}..{end}"
     r = requests.get(url, params={"from": "USD", "to": "GBP"}, timeout=20)
     r.raise_for_status()
-    data = r.json()["rates"]  # {YYYY-MM-DD: {'GBP': rate}}
+    data = r.json()["rates"]
     fx = (pd.DataFrame.from_dict(data, orient="index")
             .rename_axis("date").reset_index())
     fx["date"] = pd.to_datetime(fx["date"], errors="coerce")
@@ -43,10 +41,10 @@ def get_sp500_daily(start: str, end: str, cache_path: Path = SP500_CSV):
     # 1) Business-day calendar
     s = pd.to_datetime(start).date()
     e = pd.to_datetime(end).date()
-    cal = pd.bdate_range(s, e).date  # business days only
+    cal = pd.bdate_range(s, e).date
 
-    # 2) SPY (USD) from Stooq → reindex to daily calendar, ffill/bfill
-    spy = _fetch_spy_stooq().copy()
+    # 2) SPY (USD) from Yahoo Finance
+    spy = _fetch_spy_yfinance().copy()
     spy["date"] = pd.to_datetime(spy["date"]).dt.date
     spy = (spy.set_index("date")
               .reindex(cal)
@@ -54,7 +52,7 @@ def get_sp500_daily(start: str, end: str, cache_path: Path = SP500_CSV):
               .bfill())
     spy["close_usd"] = pd.to_numeric(spy["close_usd"], errors="coerce").astype("float64")
 
-    # 3) USD→GBP FX from ECB → reindex to daily calendar, ffill/bfill
+    # 3) USD→GBP FX from ECB
     fx = _fetch_fx_usd_gbp(start, end).copy()
     fx["date"] = pd.to_datetime(fx["date"]).dt.date
     fx = (fx.set_index("date")
