@@ -154,13 +154,22 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
     return mat
 
 def _download_fx_usd_gbp(start: date, end: date) -> pd.Series:
+    """Fetch USD->GBP FX rates with retry logic."""
     url = f"https://api.frankfurter.app/{start}..{end}"
-    r = requests.get(url, params={"from":"USD","to":"GBP"}, timeout=20)
-    r.raise_for_status()
-    data = r.json().get("rates", {})
-    fx = pd.DataFrame.from_dict(data, orient="index").rename(columns={"GBP":"usd_gbp"})
-    fx.index = pd.to_datetime(fx.index).date
-    return fx["usd_gbp"]
+    
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params={"from":"USD","to":"GBP"}, timeout=30)
+            r.raise_for_status()
+            data = r.json().get("rates", {})
+            fx = pd.DataFrame.from_dict(data, orient="index").rename(columns={"GBP":"usd_gbp"})
+            fx.index = pd.to_datetime(fx.index).date
+            return fx["usd_gbp"]
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            if attempt < 2:
+                time.sleep(5)  # wait before retry
+                continue
+            raise RuntimeError(f"FX API unavailable after 3 attempts: {e}") from e
 
 def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) -> tuple[pd.DataFrame, list[str]]:
     """
