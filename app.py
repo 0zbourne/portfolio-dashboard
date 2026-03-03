@@ -927,3 +927,33 @@ try:
 
 except Exception as e:
     st.sidebar.info(f"Perf debug unavailable: {e}")
+    
+    # Debug section - show file contents
+    with st.expander("Debug: Data Files", expanded=False):
+        st.subheader("nav_daily.csv")
+        if NAV_CSV.exists():
+            nav_debug = pd.read_csv(NAV_CSV)
+            st.write(f"Rows: {len(nav_debug)}")
+            st.write("First 5 rows:")
+            st.dataframe(nav_debug.head(5))
+            st.write("Last 5 rows:")
+            st.dataframe(nav_debug.tail(5))
+        else:
+            st.write("File not found")
+        
+        st.subheader("backfill_report.json")
+        if REPORT.exists():
+            report_debug = json.loads(REPORT.read_text(encoding="utf-8"))
+            st.json(report_debug)
+        else:
+            st.write("File not found")
+        
+        st.subheader("portfolio.json (first 2 items)")
+        if DATA.exists():
+            port_debug = json.loads(DATA.read_text(encoding="utf-8"))
+            if isinstance(port_debug, list):
+                st.json(port_debug[:2])
+            else:
+                st.json(port_debug)
+        else:
+            st.write("File not found")
