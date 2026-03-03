@@ -1,7 +1,7 @@
 # stdlib
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # third-party
@@ -24,7 +24,7 @@ except Exception:
 
 def _freshness(path: Path) -> str:
     try:
-        ts = datetime.fromtimestamp(path.stat().st_mtime)
+        ts = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
         return ts.strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         return "unknown"
@@ -140,7 +140,7 @@ def _fetch_json_quiet(url: str, timeout: int = 10):
 
 def get_cash_gbp(base_url: str) -> tuple[float | None, str]:
     try:
-        if ACC_FILE.exists() and (datetime.utcnow().timestamp() - ACC_FILE.stat().st_mtime) < 6*3600:
+        if ACC_FILE.exists() and (datetime.now(timezone.utc).timestamp() - ACC_FILE.stat().st_mtime) < 6*3600:
             data = json.loads(ACC_FILE.read_text(encoding="utf-8"))
             val, path = _extract_cash_from_json(data)
             if val is not None:
@@ -169,7 +169,7 @@ def get_cash_gbp(base_url: str) -> tuple[float | None, str]:
     return None, "unavailable"
 
 def _anchor_date_iso():
-    d = datetime.utcnow().date()
+    d = datetime.now(timezone.utc).date()
     if d.weekday() == 5:
         d = d - timedelta(days=1)
     elif d.weekday() == 6:
@@ -353,7 +353,7 @@ def get_usd_gbp_rate():
         )
         r.raise_for_status()
         rate = float(r.json()["rates"]["GBP"])
-        return rate, "frankfurter.app (ECB)", datetime.utcnow().isoformat() + "Z"
+        return rate, "frankfurter.app (ECB)", datetime.now(timezone.utc).isoformat()
     except Exception:
         pass
     return None, None, None
@@ -429,11 +429,11 @@ def load_dividends_t212(path=DIV_FILE):
         return None, f"Unexpected columns: {list(df_div.columns)}"
 
     paid = df_div["paidOn"].astype(str).str.strip().str.replace("Z", "", regex=False)
-    dt = pd.to_datetime(paid, errors="coerce")
+    dt = pd.to_datetime(paid, errors="coerce", utc=True)
     if dt.isna().all():
-        dt = pd.to_datetime(paid, format="%Y-%m-%d", errors="coerce")
+        dt = pd.to_datetime(paid, format="%Y-%m-%d", errors="coerce", utc=True)
     if dt.isna().all():
-        dt = pd.to_datetime(paid, unit="ms", errors="coerce")
+        dt = pd.to_datetime(paid, unit="ms", errors="coerce", utc=True)
 
     df_div["dt"] = dt
     if df_div["dt"].isna().all():
@@ -588,7 +588,7 @@ else:
         )
         .properties(height=280)
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
 caption = "Weights by current market value"
 if has_cash:
@@ -711,7 +711,7 @@ view = df[[
 
 st.dataframe(
     view.sort_values("total_value_gbp", ascending=False),
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
     column_config={
         "company": "Name",
@@ -771,7 +771,7 @@ try:
         from jobs.fundamentals import FUND_AUDIT, FUND_JSON
         st.caption(f"Data source: yfinance. Basis: TTM (fallback FY). Cache: weekly. File: {FUND_JSON}")
         if FUND_AUDIT.exists():
-            st.dataframe(pd.read_csv(FUND_AUDIT), use_container_width=True)
+            st.dataframe(pd.read_csv(FUND_AUDIT), width="stretch")
         else:
             st.write("Audit file not available yet.")
 except Exception as e:
@@ -788,7 +788,7 @@ if err:
     st.warning(err)
 else:
     if not is_datetime(div["dt"]):
-        div["dt"] = pd.to_datetime(div["dt"], errors="coerce")
+        div["dt"] = pd.to_datetime(div["dt"], errors="coerce", utc=True)
     div = div.dropna(subset=["dt", "amount_gbp"]).copy()
     div["amount_gbp"] = pd.to_numeric(div["amount_gbp"], errors="coerce")
     div = div.dropna(subset=["amount_gbp"])
@@ -799,11 +799,13 @@ else:
     if selected_year != "All":
         div = div[div["dt"].dt.year == int(selected_year)]
 
-    div["year_month"] = div["dt"].dt.to_period("M")
+    # Convert to UTC before period conversion to avoid timezone warning
+    div["dt_utc"] = div["dt"].dt.tz_convert("UTC")
+    div["year_month"] = div["dt_utc"].dt.to_period("M")
     monthly = div.groupby("year_month", as_index=False)["amount_gbp"].sum()
     monthly["year_month"] = monthly["year_month"].astype(str)
 
-    st.bar_chart(monthly, x="year_month", y="amount_gbp", use_container_width=True)
+    st.bar_chart(monthly, x="year_month", y="amount_gbp", width="stretch")
     st.caption("Monthly dividend cash received (GBP).")
 
 # -----------------------
@@ -838,6 +840,9 @@ from pdperf.series import read_nav, daily_returns_twr, cumulative_return, cagr
 from pdperf.cashflows import build_cash_flows
 from bench.sp500 import get_sp500_daily
 
+NAV_CSV = Path("data") / "nav_daily.csv"
+REPORT = Path("data") / "backfill_report.json"
+
 try:
     append_today_snapshot_if_missing(df)
 except Exception as e:
@@ -869,7 +874,7 @@ try:
     since_start_port = cumulative_return(merged, perf_start, today_key)
     since_start_bench = float((1 + merged["r_bench"]).prod() - 1) if not merged.empty else float("nan")
 
-    year_start = f"{datetime.utcnow().year}-01-01"
+    year_start = f"{datetime.now(timezone.utc).year}-01-01"
     ytd_slice = merged[(merged["date"] >= year_start) & (merged["date"] <= today_key)]
     ytd_port = float((1 + ytd_slice["r_port"]).prod() - 1) if not ytd_slice.empty else float("nan")
     ytd_bench = float((1 + ytd_slice["r_bench"]).prod() - 1) if not ytd_slice.empty else float("nan")
@@ -923,7 +928,7 @@ try:
             .properties(height=340)
         )
 
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width="stretch")
 
 except Exception as e:
     st.sidebar.info(f"Perf debug unavailable: {e}")
@@ -935,9 +940,9 @@ except Exception as e:
             nav_debug = pd.read_csv(NAV_CSV)
             st.write(f"Rows: {len(nav_debug)}")
             st.write("First 5 rows:")
-            st.dataframe(nav_debug.head(5))
+            st.dataframe(nav_debug.head(5), width="stretch")
             st.write("Last 5 rows:")
-            st.dataframe(nav_debug.tail(5))
+            st.dataframe(nav_debug.tail(5), width="stretch")
         else:
             st.write("File not found")
         
