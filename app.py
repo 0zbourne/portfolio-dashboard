@@ -800,8 +800,7 @@ else:
         div = div[div["dt"].dt.year == int(selected_year)]
 
     # Convert to UTC before period conversion to avoid timezone warning
-    div["dt_utc"] = div["dt"].dt.tz_convert("UTC")
-    div["year_month"] = div["dt_utc"].dt.to_period("M")
+    div["year_month"] = div["dt"].dt.tz_convert("UTC").dt.tz_localize(None).dt.to_period("M")
     monthly = div.groupby("year_month", as_index=False)["amount_gbp"].sum()
     monthly["year_month"] = monthly["year_month"].astype(str)
 
