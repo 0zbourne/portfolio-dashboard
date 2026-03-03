@@ -354,6 +354,14 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
             ysym, ccy = _infer_yf_symbol(t, overrides)
             mapping[t] = (ysym, ccy)
 
+        overrides = _load_overrides()
+
+        # Write to a debug file
+        (DATA_DIR / "_overrides_debug.txt").write_text(
+            f"Loaded {len(overrides)} overrides:\n{json.dumps(overrides, indent=2)}",
+            encoding="utf-8"
+        )
+
         # 4) Download prices
         prices, miss = _download_prices(mapping, d0, d1)
 
