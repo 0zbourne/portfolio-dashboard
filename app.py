@@ -1,6 +1,7 @@
 # stdlib
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -12,7 +13,7 @@ import streamlit as st
 import altair as alt
 from jobs.fundamentals import ensure_fundamentals, load_fundamentals
 
-# ---- FORCE NUMPY BACKEND (disable Arrow/StrDType) ----
+# ---- FORCE NUMPY BACKEND (disable Arrow/StrDtype) ----
 try:
     pd.options.mode.dtype_backend = "numpy"
 except Exception:
@@ -21,6 +22,129 @@ try:
     pd.options.mode.string_storage = "python"
 except Exception:
     pass
+
+# ---- CURRENCY DETECTION (integrated) ----
+CURRENCY_CACHE_PATH = Path("data") / "currency_cache.json"
+
+def _load_currency_cache() -> dict:
+    """Load cached currency data from file."""
+    if CURRENCY_CACHE_PATH.exists():
+        try:
+            return json.loads(CURRENCY_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+def _save_currency_cache(data: dict):
+    """Save currency cache to file."""
+    CURRENCY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CURRENCY_CACHE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def _get_yf_symbol_from_t212(t212_ticker: str) -> str | None:
+    """Convert T212 ticker to yfinance symbol for currency lookup."""
+    t = (t212_ticker or "").strip().upper()
+    
+    # US stocks - no suffix
+    if "_US_" in t:
+        return t.split("_")[0]
+    
+    # UK stocks - add .L suffix
+    core = t.replace("_GBX", "").replace("_GB", "").replace("_EQ", "")
+    core = core.split("_")[0]
+    
+    # Strip trailing 'L' if present (e.g., "RMVL" -> "RMV")
+    if core.endswith("L") and len(core) >= 4:
+        core = core[:-1]
+    
+    if core and core.isalpha() and 1 <= len(core) <= 5:
+        return f"{core}.L"
+    
+    return None
+
+@st.cache_data(ttl=24 * 3600)
+def get_yf_currency_cached(ysym: str) -> str:
+    """
+    Query yfinance for the actual currency of a ticker.
+    Returns: "GBX" (pence), "GBP" (pounds), "USD", "EUR", etc.
+    """
+    if not ysym:
+        return "USD"
+    
+    # Check file cache first
+    cache = _load_currency_cache()
+    if ysym in cache:
+        return cache[ysym]
+    
+    # Try to import yfinance
+    try:
+        import yfinance as yf
+    except Exception:
+        # Fallback to suffix-based guess
+        return "GBX" if ysym.endswith(".L") else "USD"
+    
+    try:
+        ticker = yf.Ticker(ysym)
+        info = ticker.info or {}
+        raw_ccy = info.get("currency", "")
+        
+        # Normalize yfinance currency codes
+        ccy_upper = str(raw_ccy).upper().strip()
+        
+        # yfinance returns 'GBp' for pence, 'GBP' for pounds
+        if ccy_upper in ("GBX", "GBP", "GBPOUND", "PENCE", "PENNY", "GB PENCE"):
+            result = "GBX"
+        elif ccy_upper == "GBP":
+            result = "GBP"
+        elif ccy_upper in ("USD", "US DOLLAR"):
+            result = "USD"
+        elif ccy_upper in ("EUR", "EURO"):
+            result = "EUR"
+        elif ccy_upper:
+            result = ccy_upper
+        else:
+            # Fallback to suffix-based guess
+            result = "GBX" if ysym.endswith(".L") else "USD"
+        
+        # Cache the result
+        cache[ysym] = result
+        _save_currency_cache(cache)
+        
+        # Small delay to avoid rate limiting
+        time.sleep(0.1)
+        
+        return result
+        
+    except Exception:
+        # Fallback to suffix-based guess
+        result = "GBX" if ysym.endswith(".L") else "USD"
+        cache[ysym] = result
+        _save_currency_cache(cache)
+        return result
+
+def convert_price_to_gbp(price: float, currency: str, fx_rate: float = 1.0) -> float:
+    """
+    Convert a price to GBP based on its currency.
+    
+    Args:
+        price: The raw price from yfinance/T212
+        currency: "GBX" (pence), "GBP", "USD", "EUR", etc.
+        fx_rate: USD to GBP rate (for USD conversions)
+    
+    Returns:
+        Price in GBP
+    """
+    if currency == "GBX":
+        return price / 100.0  # Pence to pounds
+    elif currency == "GBP":
+        return price  # Already in pounds
+    elif currency == "USD":
+        return price * fx_rate
+    elif currency == "EUR":
+        return price * fx_rate * 0.85  # Rough EUR/GBP approximation
+    else:
+        return price  # Unknown, assume GBP
+
+# ---- END CURRENCY DETECTION ----
 
 def _freshness(path: Path) -> str:
     try:
@@ -212,11 +336,8 @@ def load_portfolio(cache_bust: tuple):
     df["shares"] = pd.to_numeric(df["shares"], errors="coerce").fillna(0).astype(int)
     df["price_raw"] = pd.to_numeric(df["price_raw"], errors="coerce")
 
-    df["price_gbp_guess"] = np.where(
-        (df["price_raw"].notna()) & (df["price_raw"] > 1000),
-        df["price_raw"] / 100.0,
-        df["price_raw"],
-    )
+    # DO NOT use threshold guessing - currency fetched from yfinance
+    df["price_gbp_guess"] = df["price_raw"]  # Placeholder, will be replaced
     df["market_value_gbp_guess"] = df["shares"] * df["price_gbp_guess"]
     return df
 
@@ -384,14 +505,32 @@ with st.sidebar.expander("Day change settings", expanded=False):
         _save_open_prices(_store)
         st.success("Today's open prices reset. Reload to re-anchor.")
 
+# ---- FETCH CURRENCIES FOR ALL TICKERS ----
+# This replaces the broken threshold-based guessing
+ticker_currencies = {}
+with st.spinner("Fetching currency info from yfinance..."):
+    for sym in df["symbol"].unique():
+        ysym = _get_yf_symbol_from_t212(sym)
+        if ysym:
+            ticker_currencies[sym] = get_yf_currency_cached(ysym)
+        else:
+            ticker_currencies[sym] = "GBP"  # Default fallback
+
+# Show currency mapping in debug
+with st.sidebar.expander("Currency mapping", expanded=False):
+    for sym, ccy in sorted(ticker_currencies.items()):
+        ysym = _get_yf_symbol_from_t212(sym) or "N/A"
+        st.caption(f"{sym} → {ysym} → {ccy}")
+
 def gbp_price(row):
+    """Convert price to GBP using ACTUAL currency from yfinance."""
     p = row["price_raw"]
     sym = str(row["symbol"])
-    if p is None:
+    if pd.isna(p):
         return None
-    if "_US_" in sym:
-        return float(p) * usd_to_gbp
-    return float(row["price_gbp_guess"])
+    
+    ccy = ticker_currencies.get(sym, "GBP")
+    return convert_price_to_gbp(float(p), ccy, usd_to_gbp)
 
 df["price_gbp"] = df.apply(gbp_price, axis=1)
 df["market_value_gbp"] = df["shares"] * df["price_gbp"]
@@ -402,7 +541,7 @@ c1.metric("Positions", f"{len(df):,}")
 c2.metric("Total Shares", f"{int(df['shares'].sum()):,}")
 c3.metric("Market Value (GBP)", f"£{df['market_value_gbp'].sum():,.0f}")
 
-st.caption("GBX handled automatically; USD converted via the sidebar rate.")
+st.caption("Currency fetched from yfinance (GBX = pence, divided by 100; USD converted via FX rate).")
 
 # =======================
 # Dividends loader
@@ -460,26 +599,38 @@ avg_candidates = [c for c in df.columns if "average" in c.lower() and "price" in
 df["avg_cost_raw"] = pd.to_numeric(df[avg_candidates[0]], errors="coerce") if avg_candidates else None
 
 def _ccy(sym: str) -> str:
-    return "USD" if "_US_" in str(sym) else "GBP"
+    """Return display currency (USD or GBP)."""
+    return ticker_currencies.get(sym, "GBP")
 
 df["ccy"] = df["symbol"].apply(_ccy)
 df["avg_cost_raw"] = pd.to_numeric(df["avg_cost_raw"], errors="coerce")
 
 def _price_native(row):
+    """Get native price (no conversion)."""
     p = row["price_raw"]
     if pd.isna(p):
         return np.nan
-    if row["ccy"] == "USD":
+    ccy = ticker_currencies.get(row["symbol"], "GBP")
+    # If GBX, show as pence value for display (divide later for GBP)
+    if ccy == "GBX":
+        return float(p) / 100.0  # Show in pounds for consistency
+    elif ccy == "USD":
         return float(p)
-    return float(p) / 100.0 if p > 1000 else float(p)
+    else:
+        return float(p)
 
 def _avg_native(row):
+    """Get native average cost (no conversion)."""
     x = row["avg_cost_raw"]
     if pd.isna(x):
         return np.nan
-    if row["ccy"] == "USD":
+    ccy = ticker_currencies.get(row["symbol"], "GBP")
+    if ccy == "GBX":
+        return float(x) / 100.0  # Convert pence to pounds
+    elif ccy == "USD":
         return float(x)
-    return float(x) / 100.0 if x > 1000 else float(x)
+    else:
+        return float(x)
 
 df["price_native"] = df.apply(_price_native, axis=1)
 df["avg_cost_native"] = df.apply(_avg_native, axis=1)
@@ -617,7 +768,10 @@ if prev_col:
         if v is None or pd.isna(v):
             return None
         v = float(v)
-        return v if row["ccy"] == "USD" else (v / 100.0 if v > 1000 else v)
+        ccy = ticker_currencies.get(row["symbol"], "GBP")
+        if ccy == "GBX":
+            return v / 100.0
+        return v
 
     df["prev_close_native"] = df.apply(_prev_native, axis=1)
     df["day_change_native"] = df["price_native"] - df["prev_close_native"]
@@ -635,7 +789,10 @@ else:
 def _native_to_gbp(row, v):
     if pd.isna(v):
         return float("nan")
-    return float(v) * (usd_to_gbp if row["ccy"] == "USD" else 1.0)
+    ccy = ticker_currencies.get(row["symbol"], "GBP")
+    if ccy == "USD":
+        return float(v) * usd_to_gbp
+    return float(v)
 
 df["day_change_gbp"] = df.apply(
     lambda r: r["shares"] * _native_to_gbp(r, r["day_change_native"]),
@@ -657,7 +814,10 @@ if 'sel_abs' in locals() and sel_abs != "<auto>" and sel_abs in df.columns:
         if pd.isna(val):
             return float("nan")
         scaled = (val * row["shares"]) if per_share else val
-        return float(scaled) * (usd_to_gbp if row["ccy"] == "USD" else 1.0)
+        ccy = ticker_currencies.get(row["symbol"], "GBP")
+        if ccy == "USD":
+            return float(scaled) * usd_to_gbp
+        return float(scaled)
 
     df["day_change_gbp"] = df.apply(lambda r: _to_gbp(r, tmp_abs.loc[r.name]), axis=1)
 
@@ -670,7 +830,10 @@ df["day_change_pct"] = pd.to_numeric(df["day_change_pct"], errors="coerce")
 def _gbp_from_native(row, x):
     if pd.isna(x):
         return float("nan")
-    return float(x) * (usd_to_gbp if row["ccy"] == "USD" else 1.0)
+    ccy = ticker_currencies.get(row["symbol"], "GBP")
+    if ccy == "USD":
+        return float(x) * usd_to_gbp
+    return float(x)
 
 df["true_avg_cost_gbp"] = pd.to_numeric(df["true_avg_cost_gbp"], errors="coerce")
 df["dividends_gbp"] = pd.to_numeric(df["dividends_gbp"], errors="coerce")
@@ -802,7 +965,6 @@ else:
     if selected_year != "All":
         div = div[div["dt"].dt.year == int(selected_year)]
 
-    # Convert to UTC before period conversion to avoid timezone warning
     div["year_month"] = div["dt"].dt.tz_convert("UTC").dt.tz_localize(None).dt.to_period("M")
     monthly = div.groupby("year_month", as_index=False)["amount_gbp"].sum()
     monthly["year_month"] = monthly["year_month"].astype(str)
