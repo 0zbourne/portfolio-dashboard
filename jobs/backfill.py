@@ -28,11 +28,11 @@ def _t212_headers():
 
 # --- Hard-disable Arrow & nullable dtypes so everything is NumPy-native ---
 try:
-    pd.options.mode.dtype_backend = "numpy"         # pandas >=2.1
+    pd.options.mode.dtype_backend = "numpy"
 except Exception:
     pass
 try:
-    pd.options.mode.string_storage = "python"       # avoid pyarrow-backed strings
+    pd.options.mode.string_storage = "python"
 except Exception:
     pass
 
@@ -48,7 +48,7 @@ API_KEY  = os.getenv("T212_API_KEY")
 DATA_DIR = Path("data")
 NAV_CSV  = DATA_DIR / "nav_daily.csv"
 REPORT   = DATA_DIR / "backfill_report.json"
-OVERRIDES_PATH = DATA_DIR / "ticker_overrides.json"  # optional mapping file
+OVERRIDES_PATH = DATA_DIR / "ticker_overrides.json"
 
 # ---------------------------
 # Helpers: fetch & pagination
@@ -56,14 +56,13 @@ OVERRIDES_PATH = DATA_DIR / "ticker_overrides.json"  # optional mapping file
 def _auth_headers():
     if not API_KEY:
         raise RuntimeError("Missing T212_API_KEY in environment.")
-    # T212 expects "Authorization: <apiKey>"
     return {"Authorization": API_KEY, "Accept": "application/json"}
 
 def _paged_get(url: str):
     """Follow nextPagePath until exhausted. Returns list of items."""
     items = []
     next_url = url
-    for _ in range(1000):  # hard stop
+    for _ in range(1000):
         r = requests.get(next_url, headers=_t212_headers(), timeout=20)
         r.raise_for_status()
         payload = r.json()
@@ -73,9 +72,7 @@ def _paged_get(url: str):
         next_path = payload.get("nextPagePath")
         if not next_path:
             break
-        # T212 returns absolute path; join with base
         next_url = API_BASE.rstrip("/") + next_path
-        # be polite
         time.sleep(2.1)
     return items
 
@@ -111,20 +108,15 @@ def _infer_yf_symbol(t212_ticker: str, overrides: dict) -> tuple[str | None, str
         return core, "USD"
 
     # 3) LSE listings
-    #    T212 often shows something like 'AHTL_EQ', 'HLMAL_EQ', 'GAWL_EQ'.
-    #    Strip suffixes; if a trailing 'L' remains (AHTL → AHT), drop it,
-    #    then append '.L' for Yahoo.
     core = t.replace("_GBX", "").replace("_GB", "").replace("_EQ", "")
     core = core.split("_")[0]
 
-    # NEW: drop one trailing 'L' (e.g. 'AHTL' → 'AHT', 'HLMA' stays 'HLMA')
     if core.endswith("L") and len(core) >= 4:
         core = core[:-1]
 
     if core and core.isalpha() and 1 <= len(core) <= 5:
         return f"{core}.L", "GBP"
 
-    # Fallback: unknown
     return None, None
 
 def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
@@ -141,7 +133,6 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
     orders["filledAt"] = pd.to_datetime(orders["filledAt"], errors="coerce", utc=True).dt.date
     orders = orders.dropna(subset=["filledAt", "ticker", "filledQuantity"])
 
-    # BUY = +qty, SELL = -qty
     side_str = orders.get("side", "BUY").astype(str).str.upper()
     sign = np.where(side_str.str.startswith("S"), -1.0, 1.0)
     qty = pd.to_numeric(orders["filledQuantity"], errors="coerce").astype("float64")
@@ -153,15 +144,12 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
     idx = pd.date_range(start, end, freq="D").date
     tickers = sorted(daily["ticker"].unique().tolist())
 
-    # start as pure float64
     mat = pd.DataFrame(0.0, index=idx, columns=tickers, dtype="float64")
 
-    # step function positions (holdings carry forward)
     for _, r in daily.iterrows():
         d = r["date"]; tk = r["ticker"]; q = float(r["signed_qty"])
         mat.loc[mat.index >= d, tk] += q
 
-    # drop all-zero columns and guarantee float64
     mat = mat.loc[:, (mat != 0).any(axis=0)].astype("float64")
     return mat
 
@@ -177,8 +165,6 @@ def _download_fx_usd_gbp(start: date, end: date) -> pd.Series:
 def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) -> tuple[pd.DataFrame, list[str]]:
     """
     Returns GBP prices: index = calendar dates, columns = original T212 tickers.
-    Enforces float64 at every step and never multiplies pandas objects that could
-    carry strings.
     """
     missing: list[str] = []
     cal_idx = pd.date_range(start, end, freq="D").date
@@ -190,58 +176,51 @@ def _download_prices(yf_map: dict[str, tuple[str,str]], start: date, end: date) 
     gbp_syms = [t for t,(y,ccy) in yf_map.items() if y and ccy == "GBP"]
     usd_syms = [t for t,(y,ccy) in yf_map.items() if y and ccy == "USD"]
 
-def _dl(symbols: list[str]) -> pd.DataFrame:
-    """
-    Yahoo is rate-limited (429) easily. Do one batch download, no threads,
-    and back off automatically if Yahoo blocks.
-    """
-    if not symbols:
-        return pd.DataFrame()
+    def _dl(symbols: list[str]) -> pd.DataFrame:
+        """Yahoo download with backoff for rate limits."""
+        if not symbols:
+            return pd.DataFrame()
 
-    ysyms = [yf_map[t][0] for t in symbols]
+        ysyms = [yf_map[t][0] for t in symbols]
 
-    last_err: Exception | None = None
-    # backoff schedule: 2s, 5s, 10s, 20s, 40s
-    for sleep_s in (0, 2, 5, 10, 20, 40):
-        if sleep_s:
-            time.sleep(sleep_s)
+        last_err: Exception | None = None
+        for sleep_s in (0, 2, 5, 10, 20, 40):
+            if sleep_s:
+                time.sleep(sleep_s)
 
-        try:
-            df = yf.download(
-                ysyms,
-                start=str(start),
-                end=str(end + timedelta(days=1)),
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=False,   # IMPORTANT: reduce rate-limit risk
-            )
+            try:
+                df = yf.download(
+                    ysyms,
+                    start=str(start),
+                    end=str(end + timedelta(days=1)),
+                    interval="1d",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                )
 
-            # yfinance returns a multiindex columns df; we only want Close
-            close = df["Close"] if isinstance(df, pd.DataFrame) and "Close" in df else df
-            if isinstance(close, pd.Series):
-                close = close.to_frame()
+                close = df["Close"] if isinstance(df, pd.DataFrame) and "Close" in df else df
+                if isinstance(close, pd.Series):
+                    close = close.to_frame()
 
-            # If Yahoo blocked us, close can be empty
-            if close is None or close.empty:
+                if close is None or close.empty:
+                    continue
+
+                close.index = pd.to_datetime(close.index).date
+
+                for c in close.columns:
+                    close[c] = pd.to_numeric(close[c], errors="coerce").astype("float64")
+
+                return close.reindex(cal_idx)
+
+            except Exception as e:
+                last_err = e
                 continue
 
-            close.index = pd.to_datetime(close.index).date
-
-            for c in close.columns:
-                close[c] = pd.to_numeric(close[c], errors="coerce").astype("float64")
-
-            return close.reindex(cal_idx)
-
-        except Exception as e:
-            last_err = e
-            continue
-
-    # If we get here, Yahoo never gave us usable data
-    raise RuntimeError(
-        "Yahoo download failed (likely HTTP 429 rate limit). "
-        "Change IP (VPN exit) or wait, then retry."
-    ) from last_err
+        raise RuntimeError(
+            "Yahoo download failed (likely HTTP 429 rate limit). "
+            "Change IP (VPN exit) or wait, then retry."
+        ) from last_err
 
     # download by currency
     gbp_px = _dl(gbp_syms)
@@ -257,13 +236,11 @@ def _dl(symbols: list[str]) -> pd.DataFrame:
         ysym = yf_map[t][0]
         ser = gbp_px.get(ysym)
         if ser is None or ser.dropna().empty:
-            missing.append(t); continue
-        # Heuristic only (avoid per-ticker network calls that trigger 429)
+            missing.append(t)
+            continue
         med = float(ser.dropna().median()) if ser.notna().any() else None
         if med and med > 1000.0:
-            # many LSE listings are returned in pence → convert to pounds
             ser = ser / 100.0
-
         out[t] = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
 
     # ---- USD listings (NumPy multiply only) ----
@@ -272,7 +249,8 @@ def _dl(symbols: list[str]) -> pd.DataFrame:
             ysym = yf_map[t][0]
             ser = usd_px.get(ysym)
             if ser is None or ser.dropna().empty:
-                missing.append(t); continue
+                missing.append(t)
+                continue
             ser = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
             ser_np = ser.to_numpy(dtype=np.float64, na_value=np.nan)
             out[t] = pd.Series(ser_np * fx_np, index=cal_idx, dtype="float64")
@@ -286,11 +264,8 @@ def _dl(symbols: list[str]) -> pd.DataFrame:
 def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) -> Path:
     """
     Rebuild nav_daily.csv using Trading212 orders + yfinance prices.
-    On any failure, writes data/_backfill_trace.txt with the full traceback and any dtype info we reached.
     """
-    # ---------- black-box crash logger ----------
-    import json, traceback
-    from datetime import datetime, timedelta
+    import traceback
 
     trace_path = DATA_DIR / "_backfill_trace.txt"
 
@@ -313,19 +288,16 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
                     bad = prices.select_dtypes(exclude=["float64"])
                     if not bad.empty:
                         f.write("non_float_prices: " + str(bad.columns.tolist()) + "\n")
-        except Exception as _e:  # don't let logging fail the run
+        except Exception as _e:
             print("[WARN] failed to write _backfill_trace.txt:", _e)
 
-    # ---------- original logic (kept, but wrapped) ----------
     try:
-        # marker so we know the button actually called us
         (DATA_DIR / "_backfill_called.txt").write_text(
             f"called at {datetime.utcnow().isoformat()}Z\n", encoding="utf-8"
         )
 
-        # dates
         d0 = datetime.strptime(start, "%Y-%m-%d").date()
-        d1 = datetime.strptime(end,   "%Y-%m-%d").date() if end else datetime.utcnow().date()
+        d1 = datetime.strptime(end, "%Y-%m-%d").date() if end else datetime.utcnow().date()
 
         # 1) Orders from Trading212
         fetch_from = "1970-01-01"
@@ -335,18 +307,12 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
             raise RuntimeError("No order history returned from Trading212.")
 
         o = pd.json_normalize(items)
-        if "status" in o.columns:
-            o = o[o["status"].astype(str).str.upper().eq("FILLED")]
 
-        # --- NEW: handle Trading212's nested schema (order.* / fill.*) ---
-        # Status column can be "status" (old) or "order.status" (new)
         status_col = next((c for c in ["status", "order.status"] if c in o.columns), None)
         if status_col:
             o = o[o[status_col].astype(str).str.upper().eq("FILLED")]
 
-        # Prefer fill-level timestamp if present (matches fill qty/price)
         time_col = next((c for c in ["fill.filledAt", "filledAt", "order.filledAt", "order.createdAt"] if c in o.columns), None)
-        # Fallback: anything ending in ".filledAt" or ending in "filledAt"
         if time_col is None:
             time_col = next((c for c in o.columns if str(c).endswith(".filledAt") or str(c).endswith("filledAt")), None)
         if time_col is None:
@@ -362,7 +328,6 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
 
         side_col = next((c for c in ["order.side", "side"] if c in o.columns), None)
 
-        # Build canonical dataframe expected by downstream functions
         w = pd.DataFrame({
             "ticker": o[ticker_col],
             "filledQuantity": o[qty_col],
@@ -370,42 +335,41 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
             "side": o[side_col] if side_col else "BUY",
         })
 
-        # 2) Build positions timeseries (float64 matrix)
+        # 2) Build positions timeseries
         pos = _build_position_timeseries(w[["ticker","side","filledQuantity","filledAt"]], d0, d1)
 
-        # 3) Map tickers to yfinance & currencies (using your overrides)
+        # 3) Map tickers to yfinance & currencies
         overrides = _load_overrides()
         mapping: dict[str, tuple[str,str]] = {}
         for t in pos.columns:
             ysym, ccy = _infer_yf_symbol(t, overrides)
             mapping[t] = (ysym, ccy)
 
-        # 4) Download prices (GBP/GBp normalized, USD->GBP converted)
+        # 4) Download prices
         prices, miss = _download_prices(mapping, d0, d1)
 
-        # align columns present on both sides
+        # align columns
         keep = [t for t in pos.columns if t in prices.columns]
         if not keep:
             raise RuntimeError("No overlapping tickers between positions and prices.")
         pos = pos[keep]
         prices = prices[keep]
 
-        # 5) Align to full calendar and ffill; hard-cast float64
+        # 5) Align to full calendar
         full_idx = pd.date_range(d0, d1, freq="D").date
-        prices = (prices.sort_index().reindex(full_idx).ffill().astype("float64"))
-        pos    = (pos.sort_index().reindex(full_idx).ffill().fillna(0.0).astype("float64"))
+        prices = prices.sort_index().reindex(full_idx).ffill().astype("float64")
+        pos = pos.sort_index().reindex(full_idx).ffill().fillna(0.0).astype("float64")
 
-        # quick dtype snapshot (if we reached here, file will exist)
         with open(DATA_DIR / "_dtype_snapshot.txt", "w", encoding="utf-8") as f:
             f.write("[positions.dtypes]\n")
             f.write(str(pos.dtypes) + "\n\n")
             f.write("[prices.dtypes]\n")
             f.write(str(prices.dtypes) + "\n\n")
 
-        # 6) Multiply strictly on float64 arrays
-        pos_np    = pos.to_numpy(dtype=np.float64, na_value=np.nan)
+        # 6) Calculate NAV
+        pos_np = pos.to_numpy(dtype=np.float64, na_value=np.nan)
         prices_np = prices.to_numpy(dtype=np.float64, na_value=np.nan)
-        nav_vals  = np.nansum(pos_np * prices_np, axis=1)
+        nav_vals = np.nansum(pos_np * prices_np, axis=1)
 
         nav = pd.DataFrame({
             "date": pd.to_datetime(full_idx).strftime("%Y-%m-%d"),
@@ -414,8 +378,7 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         NAV_CSV.parent.mkdir(parents=True, exist_ok=True)
         nav.to_csv(NAV_CSV, index=False)
 
-        REPORT.write_text(json.dumps({"missing_symbols": miss, "mapped": mapping}, indent=2),
-                          encoding="utf-8")
+        REPORT.write_text(json.dumps({"missing_symbols": miss, "mapped": mapping}, indent=2), encoding="utf-8")
         return NAV_CSV
 
     except Exception:
