@@ -754,4 +754,176 @@ try:
 
     st.subheader("Portfolio quality (TTM, weight-adjusted)")
     st.caption(f"As of { _freshness(Path('data') / 'fundamentals.json') }")
-    k1, k2, k3, k4, k5 = st.columns
+    k1, k2, k3, k4, k5 = st.columns(5)
+
+    def _fmt_pct(x):
+        return "N/A" if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) else f"{x*100:.0f}%"
+    def _fmt_ic(x):
+        return "N/A" if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))) else f"{x:.1f}×"
+
+    k1.metric("ROCE", _fmt_pct(agg.get("roce")))
+    k2.metric("Gross margin", _fmt_pct(agg.get("gm")))
+    k3.metric("Operating margin", _fmt_pct(agg.get("om")))
+    k4.metric("Cash conversion (FCF/EBIT)", _fmt_pct(agg.get("cc")))
+    k5.metric("Interest cover", _fmt_ic(agg.get("ic")))
+
+    with st.expander("Quality audit (per-ticker)", expanded=False):
+        from jobs.fundamentals import FUND_AUDIT, FUND_JSON
+        st.caption(f"Data source: yfinance. Basis: TTM (fallback FY). Cache: weekly. File: {FUND_JSON}")
+        if FUND_AUDIT.exists():
+            st.dataframe(pd.read_csv(FUND_AUDIT), use_container_width=True)
+        else:
+            st.write("Audit file not available yet.")
+except Exception as e:
+    st.warning(f"Quality strip unavailable: {e}")
+
+# ---- Render dividends timeline ----
+from pandas.api.types import is_datetime64_any_dtype as is_datetime
+
+div, err = load_dividends_t212(DIV_FILE)
+
+st.subheader("Dividends timeline")
+if err:
+    st.write("Dividends (inspect)")
+    st.warning(err)
+else:
+    if not is_datetime(div["dt"]):
+        div["dt"] = pd.to_datetime(div["dt"], errors="coerce")
+    div = div.dropna(subset=["dt", "amount_gbp"]).copy()
+    div["amount_gbp"] = pd.to_numeric(div["amount_gbp"], errors="coerce")
+    div = div.dropna(subset=["amount_gbp"])
+
+    years = sorted(div["dt"].dt.year.unique().tolist())
+    selected_year = st.sidebar.selectbox("Year", options=["All"] + years, index=0)
+
+    if selected_year != "All":
+        div = div[div["dt"].dt.year == int(selected_year)]
+
+    div["year_month"] = div["dt"].dt.to_period("M")
+    monthly = div.groupby("year_month", as_index=False)["amount_gbp"].sum()
+    monthly["year_month"] = monthly["year_month"].astype(str)
+
+    st.bar_chart(monthly, x="year_month", y="amount_gbp", use_container_width=True)
+    st.caption("Monthly dividend cash received (GBP).")
+
+# -----------------------
+# One-off NAV backfill UI
+# -----------------------
+with st.sidebar.expander("Backfill NAV (since 2025-01-01)", expanded=False):
+    st.write("Rebuild daily NAV in GBP from **orders** + yfinance prices. Optional overrides: data/ticker_overrides.json")
+    start_str = st.text_input("Start date", value="2025-01-01")
+
+    if st.button("Run NAV backfill"):
+        try:
+            from jobs.backfill import backfill_nav_from_orders
+            out_path = backfill_nav_from_orders(start=start_str)
+            st.success(f"NAV backfill complete → {out_path}")
+            rep_path = Path("data") / "backfill_report.json"
+            if rep_path.exists():
+                rep = json.loads(rep_path.read_text(encoding="utf-8"))
+                missing = rep.get("missing_symbols", [])
+                if missing:
+                    st.warning(f"No price history for: {', '.join(missing)}. Add mappings in data/ticker_overrides.json.")
+                else:
+                    st.caption("All symbols fetched successfully.")
+        except Exception as e:
+            st.exception(e)
+            st.caption("See data/_backfill_trace.txt for full details.")
+
+# =======================
+# Backend performance plumbing
+# =======================
+from jobs.snapshot import append_today_snapshot_if_missing
+from pdperf.series import read_nav, daily_returns_twr, cumulative_return, cagr
+from pdperf.cashflows import build_cash_flows
+from bench.sp500 import get_sp500_daily
+
+try:
+    append_today_snapshot_if_missing(df)
+except Exception as e:
+    st.sidebar.warning(f"NAV snapshot not updated: {e}")
+
+try:
+    today_key = _anchor_date_iso()
+
+    nav = read_nav()
+    flows = build_cash_flows(Path("data") / "transactions.json")
+    port_daily = daily_returns_twr(nav, flows)
+
+    perf_start = pd.to_datetime(nav.index).min().strftime("%Y-%m-%d")
+    sp = get_sp500_daily(perf_start, today_key)
+
+    port_daily["date"] = pd.to_datetime(port_daily["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    sp["date"] = pd.to_datetime(sp["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    merged = (
+        port_daily.merge(
+            sp[["date", "daily_ret"]].rename(columns={"daily_ret": "r_bench"}),
+            on="date",
+            how="inner"
+        )
+        .dropna(subset=["r_port", "r_bench"])
+        .sort_values("date")
+    )
+
+    since_start_port = cumulative_return(merged, perf_start, today_key)
+    since_start_bench = float((1 + merged["r_bench"]).prod() - 1) if not merged.empty else float("nan")
+
+    year_start = f"{datetime.utcnow().year}-01-01"
+    ytd_slice = merged[(merged["date"] >= year_start) & (merged["date"] <= today_key)]
+    ytd_port = float((1 + ytd_slice["r_port"]).prod() - 1) if not ytd_slice.empty else float("nan")
+    ytd_bench = float((1 + ytd_slice["r_bench"]).prod() - 1) if not ytd_slice.empty else float("nan")
+
+    if pd.notna(since_start_port) and pd.notna(since_start_bench):
+        st.sidebar.caption(f"Since {perf_start}: Portfolio {since_start_port:.2%} vs S&P {since_start_bench:.2%}")
+    if pd.notna(ytd_port) and pd.notna(ytd_bench):
+        st.sidebar.caption(f"YTD (backend): Portfolio {ytd_port:.2%} vs S&P {ytd_bench:.2%}")
+
+    anchor = "2025-01-01"
+
+    plot = merged[merged["date"] >= anchor].copy()
+    if plot.empty:
+        st.info("Not enough data after the anchor date to draw the NAV vs S&P chart.")
+    else:
+        plot["Portfolio (TWR)"] = (100.0 * (1.0 + plot["r_port"]).cumprod()).astype("float64")
+        plot["S&P 500 (GBP)"] = (100.0 * (1.0 + plot["r_bench"]).cumprod()).astype("float64")
+
+        st.subheader("NAV vs S&P 500 (rebased to 100)")
+        st.caption(f"As of { _freshness(Path('data') / 'nav_daily.csv') }")
+
+        plot_alt = plot.copy()
+        plot_alt["date"] = pd.to_datetime(plot_alt["date"], errors="coerce")
+        plot_alt = plot_alt.melt(
+            id_vars=["date"],
+            value_vars=["Portfolio (TWR)", "S&P 500 (GBP)"],
+            var_name="series",
+            value_name="index"
+        )
+
+        y_min = float(plot[["Portfolio (TWR)", "S&P 500 (GBP)"]].min().min()) * 0.95
+        y_max = float(plot[["Portfolio (TWR)", "S&P 500 (GBP)"]].max().max()) * 1.05
+
+        chart = (
+            alt.Chart(plot_alt)
+            .mark_line()
+            .encode(
+                x=alt.X("date:T", title=""),
+                y=alt.Y(
+                    "index:Q",
+                    title="Index (rebased = 100)",
+                    scale=alt.Scale(domain=[y_min, y_max], nice=False, zero=False),
+                ),
+                color=alt.Color("series:N", legend=alt.Legend(title=None)),
+                tooltip=[
+                    alt.Tooltip("date:T", title="Date"),
+                    alt.Tooltip("series:N", title="Series"),
+                    alt.Tooltip("index:Q", title="Value", format=".2f"),
+                ],
+            )
+            .properties(height=340)
+        )
+
+        st.altair_chart(chart, use_container_width=True)
+
+except Exception as e:
+    st.sidebar.info(f"Perf debug unavailable: {e}")
