@@ -81,6 +81,31 @@ def _load_overrides() -> dict:
     return {}
 
 
+def _get_yf_symbol_from_t212(t212_ticker: str) -> str | None:
+    """
+    Convert T212 ticker to yfinance symbol (backwards compatibility for fundamentals.py).
+    Returns just the yf symbol, no currency.
+    """
+    t = (t212_ticker or "").strip().upper()
+    
+    # US stocks - no suffix
+    if "_US_" in t:
+        return t.split("_")[0]
+    
+    # UK stocks - add .L suffix
+    core = t.replace("_GBX", "").replace("_GB", "").replace("_EQ", "")
+    core = core.split("_")[0]
+    
+    # Strip trailing 'L' if present (e.g., "RMVL" -> "RMV")
+    if core.endswith("L") and len(core) >= 4:
+        core = core[:-1]
+    
+    if core and core.isalpha() and 1 <= len(core) <= 5:
+        return f"{core}.L"
+    
+    return None
+
+
 def _infer_yf_symbol(t212_ticker: str, overrides: dict) -> tuple[str | None, str]:
     """
     Map a Trading212 ticker to a Yahoo Finance symbol.
@@ -461,7 +486,3 @@ def get_nav_breakdown(date_str: str) -> pd.DataFrame | None:
     except Exception as e:
         print(f"[ERROR] get_nav_breakdown failed: {e}")
         return None
-
-
-# Backwards compatibility alias for fundamentals.py
-_infer_yf_symbol = _infer_yf_symbol
