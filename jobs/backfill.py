@@ -204,24 +204,24 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
     orders["filledAt"] = pd.to_datetime(orders["filledAt"], errors="coerce", utc=True).dt.date
     orders = orders.dropna(subset=["filledAt", "ticker", "filledQuantity"])
 
+    # Convert side to numeric
     side_str = orders.get("side", "BUY").astype(str).str.upper()
     sign = np.where(side_str.str.startswith("S"), -1.0, 1.0)
     qty = pd.to_numeric(orders["filledQuantity"], errors="coerce").astype("float64")
     orders["signed_qty"] = qty * sign
 
-    daily = (orders.groupby(["filledAt", "ticker"], as_index=False)["signed_qty"]
-                    .sum().rename(columns={"filledAt": "date"}))
-
+    # Create a full calendar
     idx = pd.date_range(start, end, freq="D").date
-    tickers = sorted(daily["ticker"].unique().tolist())
-
+    tickers = sorted(orders["ticker"].unique().tolist())
     mat = pd.DataFrame(0.0, index=idx, columns=tickers, dtype="float64")
 
-    for _, r in daily.iterrows():
-        d = r["date"]
-        tk = r["ticker"]
-        q = float(r["signed_qty"])
-        mat.loc[mat.index >= d, tk] += q
+    # For each day, calculate position by summing all trades up to that day
+    for day in idx:
+        for ticker in tickers:
+            # Sum all trades for this ticker up to (and including) this day
+            trades = orders[(orders["ticker"] == ticker) & (orders["filledAt"] <= day)]
+            if not trades.empty:
+                mat.loc[day, ticker] = trades["signed_qty"].sum()
 
     mat = mat.loc[:, (mat != 0).any(axis=0)].astype("float64")
     return mat
