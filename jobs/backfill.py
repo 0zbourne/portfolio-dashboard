@@ -42,6 +42,11 @@ NAV_CSV = DATA_DIR / "nav_daily.csv"
 REPORT = DATA_DIR / "backfill_report.json"
 OVERRIDES_PATH = DATA_DIR / "ticker_overrides.json"
 
+# Cache files for debugging
+POSITIONS_CACHE = DATA_DIR / "positions_cache.parquet"
+PRICES_CACHE = DATA_DIR / "prices_cache.parquet"
+MAPPING_CACHE = DATA_DIR / "mapping_cache.json"
+
 
 def _auth_headers():
     if not API_KEY:
@@ -257,6 +262,7 @@ def _download_prices(yf_map: dict[str, tuple[str, str]], start: date, end: date)
 def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) -> Path:
     """
     Rebuild nav_daily.csv using Trading212 orders + yfinance prices.
+    Also saves positions and prices cache for debugging.
     """
     import traceback
 
@@ -355,6 +361,14 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         prices = prices.sort_index().reindex(full_idx).ffill().astype("float64")
         pos = pos.sort_index().reindex(full_idx).ffill().fillna(0.0).astype("float64")
 
+        # === SAVE CACHES FOR DEBUGGING ===
+        try:
+            pos.to_parquet(POSITIONS_CACHE)
+            prices.to_parquet(PRICES_CACHE)
+            MAPPING_CACHE.write_text(json.dumps(mapping, indent=2, default=str), encoding="utf-8")
+        except Exception as e:
+            print(f"[WARN] Failed to save debug caches: {e}")
+
         # 7) Calculate NAV
         pos_np = pos.to_numpy(dtype=np.float64, na_value=np.nan)
         prices_np = prices.to_numpy(dtype=np.float64, na_value=np.nan)
@@ -373,6 +387,80 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
     except Exception:
         _dump_trace("FAILED", pos=locals().get("pos"), prices=locals().get("prices"))
         raise
+
+
+def get_nav_breakdown(date_str: str) -> pd.DataFrame | None:
+    """
+    Get NAV breakdown for a specific date.
+    Returns DataFrame with columns: ticker, yf_symbol, shares, price_gbp, value_gbp
+    """
+    try:
+        if not POSITIONS_CACHE.exists() or not PRICES_CACHE.exists():
+            return None
+
+        pos = pd.read_parquet(POSITIONS_CACHE)
+        prices = pd.read_parquet(PRICES_CACHE)
+        mapping = json.loads(MAPPING_CACHE.read_text(encoding="utf-8")) if MAPPING_CACHE.exists() else {}
+
+        # Parse date
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+
+        # Find the date in the index
+        if target_date not in pos.index:
+            # Try to find closest date
+            idx_dates = [d for d in pos.index if d <= target_date]
+            if not idx_dates:
+                return None
+            target_date = max(idx_dates)
+
+        # Get positions and prices for that date
+        pos_row = pos.loc[target_date]
+        price_row = prices.loc[target_date]
+
+        # Build breakdown
+        rows = []
+        for ticker in pos.columns:
+            shares = float(pos_row[ticker])
+            if shares == 0:
+                continue
+
+            price = float(price_row[ticker]) if ticker in prices.columns else float("nan")
+            value = shares * price if not np.isnan(price) else float("nan")
+
+            yf_sym, ccy = mapping.get(ticker, (None, None))
+
+            rows.append({
+                "ticker": ticker,
+                "yf_symbol": yf_sym or "N/A",
+                "currency": ccy or "N/A",
+                "shares": shares,
+                "price_gbp": price,
+                "value_gbp": value,
+            })
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return None
+
+        # Sort by value descending
+        df = df.sort_values("value_gbp", ascending=False, na_position="last").reset_index(drop=True)
+
+        # Add total row
+        total_row = pd.DataFrame([{
+            "ticker": "TOTAL",
+            "yf_symbol": "",
+            "currency": "",
+            "shares": "",
+            "price_gbp": "",
+            "value_gbp": df["value_gbp"].sum(),
+        }])
+        df = pd.concat([df, total_row], ignore_index=True)
+
+        return df
+
+    except Exception as e:
+        print(f"[ERROR] get_nav_breakdown failed: {e}")
+        return None
 
 
 # Backwards compatibility alias for fundamentals.py
