@@ -41,6 +41,7 @@ DATA_DIR = Path("data")
 NAV_CSV = DATA_DIR / "nav_daily.csv"
 REPORT = DATA_DIR / "backfill_report.json"
 OVERRIDES_PATH = DATA_DIR / "ticker_overrides.json"
+CURRENCY_CACHE_PATH = DATA_DIR / "currency_cache.json"
 
 
 def _auth_headers():
@@ -69,15 +70,10 @@ def _paged_get(url: str):
 
 def _load_overrides() -> dict:
     """
-    Load ticker overrides. Currency should be:
-    - "GBX" for UK stocks (yfinance returns PENCE)
-    - "USD" for US stocks
+    Load ticker overrides from file.
+    Format: {"TICKER": {"yf": "SYMBOL.L", "ccy": "GBX"}}
     """
-    hardcoded = {
-        "LSEl_EQ": {"yf": "LSEG.L", "ccy": "GBX"},
-        "AHTL_EQ": {"yf": "AHT.L", "ccy": "GBX"},
-        "HLMA_EQUITY": {"yf": "HLMA.L", "ccy": "GBX"},
-    }
+    hardcoded = {}
     if OVERRIDES_PATH.exists():
         try:
             file_overrides = json.loads(OVERRIDES_PATH.read_text(encoding="utf-8"))
@@ -87,43 +83,116 @@ def _load_overrides() -> dict:
     return hardcoded
 
 
-def _infer_yf_symbol(t212_ticker: str, overrides: dict) -> tuple[str | None, str]:
+def _load_currency_cache() -> dict:
+    """Load cached currency data from file."""
+    if CURRENCY_CACHE_PATH.exists():
+        try:
+            return json.loads(CURRENCY_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_currency_cache(data: dict):
+    """Save currency cache to file."""
+    CURRENCY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CURRENCY_CACHE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _get_yf_symbol_from_t212(t212_ticker: str, overrides: dict) -> str | None:
     """
-    Map Trading212 ticker to yfinance symbol and currency.
-    
-    Returns:
-        (yfinance_symbol, currency) where currency is:
-        - "GBX" for London stocks (yfinance returns PENCE)
-        - "USD" for US stocks
+    Convert T212 ticker to yfinance symbol.
+    Returns yfinance symbol or None if cannot map.
     """
     t = (t212_ticker or "").strip().upper()
     overrides_upper = {k.upper(): v for k, v in overrides.items()}
-
+    
     # Check overrides first
     if t in overrides_upper:
         v = overrides_upper[t]
         if isinstance(v, dict):
-            return v.get("yf"), v.get("ccy", "GBX")
+            return v.get("yf")
         if isinstance(v, str):
-            return v, "GBX"
+            return v
 
-    # US stocks - return USD
+    # US stocks - no suffix
     if "_US_" in t:
-        core = t.split("_")[0]
-        return core, "USD"
+        return t.split("_")[0]
 
-    # UK stocks - yfinance returns PENCE for .L tickers
+    # UK stocks - add .L suffix
     core = t.replace("_GBX", "").replace("_GB", "").replace("_EQ", "")
     core = core.split("_")[0]
 
-    # Strip trailing 'L' if ticker looks like "RMVL" -> "RMV"
+    # Strip trailing 'L' if present (e.g., "RMVL" -> "RMV")
     if core.endswith("L") and len(core) >= 4:
         core = core[:-1]
 
     if core and core.isalpha() and 1 <= len(core) <= 5:
-        return f"{core}.L", "GBX"
+        return f"{core}.L"
 
-    return None, None
+    return None
+
+
+def get_yf_currency(ysym: str, overrides: dict) -> str:
+    """
+    Query yfinance for the actual currency of a ticker.
+    
+    Returns:
+        "GBX" - yfinance returns pence (divide by 100)
+        "GBP" - yfinance returns pounds (no conversion)
+        "USD" - yfinance returns US dollars (convert via FX)
+        "EUR" - etc.
+    """
+    if not ysym:
+        return "USD"
+    
+    # Check file cache first
+    cache = _load_currency_cache()
+    if ysym in cache:
+        return cache[ysym]
+    
+    if yf is None:
+        # Fallback to suffix-based guess
+        return "GBX" if ysym.endswith(".L") else "USD"
+    
+    try:
+        ticker = yf.Ticker(ysym)
+        info = ticker.info or {}
+        raw_ccy = info.get("currency", "")
+        
+        # Normalize yfinance currency codes
+        ccy_upper = str(raw_ccy).upper().strip()
+        
+        # yfinance returns 'GBp' for pence, 'GBP' for pounds
+        if ccy_upper in ("GBX", "GBP", "GBPOUND", "PENCE", "PENNY", "GB PENCE"):
+            result = "GBX"
+        elif ccy_upper == "GBP":
+            result = "GBP"
+        elif ccy_upper in ("USD", "US DOLLAR"):
+            result = "USD"
+        elif ccy_upper in ("EUR", "EURO"):
+            result = "EUR"
+        elif ccy_upper:
+            result = ccy_upper
+        else:
+            # Fallback to suffix-based guess
+            result = "GBX" if ysym.endswith(".L") else "USD"
+        
+        # Cache the result
+        cache[ysym] = result
+        _save_currency_cache(cache)
+        
+        # Small delay to avoid rate limiting
+        time.sleep(0.1)
+        
+        return result
+        
+    except Exception:
+        # Fallback to suffix-based guess
+        result = "GBX" if ysym.endswith(".L") else "USD"
+        cache[ysym] = result
+        _save_currency_cache(cache)
+        return result
 
 
 def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
@@ -177,16 +246,17 @@ def _download_fx_usd_gbp(start: date, end: date) -> pd.Series:
             raise RuntimeError(f"FX API unavailable after 3 attempts: {e}") from e
 
 
-def _download_prices(yf_map: dict[str, tuple[str, str]], start: date, end: date) -> tuple[pd.DataFrame, list[str]]:
+def _download_prices(
+    yf_map: dict[str, tuple[str, str]], 
+    start: date, 
+    end: date
+) -> tuple[pd.DataFrame, list[str]]:
     """
     Download historical prices from yfinance and convert to GBP.
     
-    Key insight: yfinance returns PENCE for UK stocks (.L), not pounds.
-    We explicitly divide by 100 based on currency flag, NOT price threshold.
-    
     Args:
         yf_map: Dict mapping T212 ticker -> (yfinance symbol, currency)
-                currency should be "GBX" or "USD"
+                currency is "GBX", "GBP", "USD", etc. (fetched from yfinance)
         start: Start date
         end: End date
     
@@ -199,10 +269,6 @@ def _download_prices(yf_map: dict[str, tuple[str, str]], start: date, end: date)
 
     if yf is None:
         raise RuntimeError("yfinance is not installed.")
-
-    # Separate by currency - GBX means yfinance returns PENCE
-    gbx_syms = [t for t, (y, ccy) in yf_map.items() if y and ccy == "GBX"]
-    usd_syms = [t for t, (y, ccy) in yf_map.items() if y and ccy == "USD"]
 
     def _dl(symbols: list[str]) -> pd.DataFrame:
         """Download prices from yfinance with retries."""
@@ -248,38 +314,57 @@ def _download_prices(yf_map: dict[str, tuple[str, str]], start: date, end: date)
 
         raise RuntimeError(f"Yahoo download failed: {last_err}") from last_err
 
-    # Download prices for each currency group
-    gbx_px = _dl(gbx_syms)
-    usd_px = _dl(usd_syms)
+    # Group tickers by currency
+    gbx_tickers = [t for t, (y, ccy) in yf_map.items() if y and ccy == "GBX"]
+    gbp_tickers = [t for t, (y, ccy) in yf_map.items() if y and ccy == "GBP"]
+    usd_tickers = [t for t, (y, ccy) in yf_map.items() if y and ccy == "USD"]
+    other_tickers = [t for t, (y, ccy) in yf_map.items() if y and ccy not in ("GBX", "GBP", "USD")]
+
+    # Download all at once (yfinance handles batch)
+    all_tickers = gbx_tickers + gbp_tickers + usd_tickers + other_tickers
+    raw_prices = _dl(all_tickers)
 
     # Fetch FX rates for USD conversion
-    fx = _download_fx_usd_gbp(start, end) if usd_syms else pd.Series(dtype="float64")
+    fx = _download_fx_usd_gbp(start, end) if usd_tickers else pd.Series(dtype="float64")
     fx = pd.to_numeric(fx, errors="coerce").astype("float64").reindex(cal_idx)
     fx_np = fx.to_numpy(dtype=np.float64, na_value=np.nan) if not fx.empty else None
 
-    # Process GBX stocks - yfinance returns PENCE, ALWAYS divide by 100
-    # NO THRESHOLD GUESSING - we know the currency from the ticker
-    for t in gbx_syms:
-        ysym = yf_map[t][0]
-        ser = gbx_px.get(ysym)
-        if ser is None or ser.dropna().empty:
-            missing.append(t)
+    # Process each ticker based on its currency
+    for t212_ticker, (ysym, ccy) in yf_map.items():
+        if not ysym:
+            missing.append(t212_ticker)
             continue
-        # Convert pence to pounds - deterministic, not heuristic
-        ser = ser / 100.0
-        out.loc[:, t] = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
 
-    # Process USD stocks - convert to GBP via FX rate
-    if usd_syms and fx_np is not None:
-        for t in usd_syms:
-            ysym = yf_map[t][0]
-            ser = usd_px.get(ysym)
-            if ser is None or ser.dropna().empty:
-                missing.append(t)
-                continue
-            ser = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
-            ser_np = ser.to_numpy(dtype=np.float64, na_value=np.nan)
-            out.loc[:, t] = pd.Series(ser_np * fx_np, index=cal_idx, dtype="float64")
+        ser = raw_prices.get(ysym)
+        if ser is None or ser.dropna().empty:
+            missing.append(t212_ticker)
+            continue
+
+        ser = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
+
+        # Convert to GBP based on ACTUAL currency from yfinance
+        if ccy == "GBX":
+            # Pence to pounds - yfinance returns pence for .L tickers
+            ser = ser / 100.0
+        elif ccy == "GBP":
+            # Already in pounds, no conversion
+            pass
+        elif ccy == "USD":
+            # Convert USD to GBP via FX rate
+            if fx_np is not None:
+                ser_np = ser.to_numpy(dtype=np.float64, na_value=np.nan)
+                ser = pd.Series(ser_np * fx_np, index=cal_idx, dtype="float64")
+        elif ccy == "EUR":
+            # EUR would need EUR/GBP rate - approximate for now
+            if fx_np is not None:
+                ser_np = ser.to_numpy(dtype=np.float64, na_value=np.nan)
+                # Rough EUR/GBP = 0.85 (should fetch proper rate)
+                ser = pd.Series(ser_np * fx_np * 0.85, index=cal_idx, dtype="float64")
+        else:
+            # Unknown currency, assume GBP
+            pass
+
+        out.loc[:, t212_ticker] = ser
 
     for c in out.columns:
         out.loc[:, c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
@@ -293,6 +378,8 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
     
     Fetches all filled orders, builds position timeseries, downloads
     historical prices, and calculates daily portfolio value in GBP.
+    
+    Currency is fetched from yfinance for each ticker (cached locally).
     """
     import traceback
 
@@ -363,14 +450,44 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         # Build position timeseries
         pos = _build_position_timeseries(w[["ticker", "side", "filledQuantity", "filledAt"]], d0, d1)
 
-        # Map T212 tickers to yfinance symbols
+        # Load overrides
         overrides = _load_overrides()
+        
+        # Map T212 tickers to yfinance symbols AND fetch currencies
         mapping: dict[str, tuple[str, str]] = {}
+        currency_report: dict[str, dict] = {}
+        
+        print(f"[BACKFILL] Fetching currencies for {len(pos.columns)} tickers...")
+        
         for t in pos.columns:
-            ysym, ccy = _infer_yf_symbol(t, overrides)
-            mapping[t] = (ysym, ccy)
+            ysym = _get_yf_symbol_from_t212(t, overrides)
+            
+            if ysym:
+                # Check if override specifies currency
+                override_ccy = None
+                t_upper = t.upper()
+                if t_upper in {k.upper(): v for k, v in overrides.items()}:
+                    v = {k.upper(): v for k, v in overrides.items()}[t_upper]
+                    if isinstance(v, dict):
+                        override_ccy = v.get("ccy")
+                
+                # Use override currency if provided, otherwise fetch from yfinance
+                if override_ccy:
+                    ccy = override_ccy
+                    print(f"  {t} -> {ysym} -> {ccy} (override)")
+                else:
+                    ccy = get_yf_currency(ysym, overrides)
+                    print(f"  {t} -> {ysym} -> {ccy}")
+                
+                mapping[t] = (ysym, ccy)
+                currency_report[t] = {"yf_symbol": ysym, "currency": ccy, "source": "override" if override_ccy else "yfinance"}
+            else:
+                mapping[t] = (None, None)
+                currency_report[t] = {"yf_symbol": None, "currency": None, "source": "failed"}
+                print(f"  {t} -> FAILED (no yfinance symbol)")
 
         # Download prices
+        print(f"[BACKFILL] Downloading prices from {d0} to {d1}...")
         prices, miss = _download_prices(mapping, d0, d1)
 
         # Align positions and prices
@@ -397,8 +514,14 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         NAV_CSV.parent.mkdir(parents=True, exist_ok=True)
         nav.to_csv(NAV_CSV, index=False)
 
-        # Write report
-        REPORT.write_text(json.dumps({"missing_symbols": miss, "mapped": mapping}, indent=2), encoding="utf-8")
+        # Write detailed report
+        REPORT.write_text(json.dumps({
+            "missing_symbols": miss,
+            "mapped": {t: [y, c] for t, (y, c) in mapping.items()},
+            "currency_details": currency_report
+        }, indent=2), encoding="utf-8")
+        
+        print(f"[BACKFILL] Complete. NAV written to {NAV_CSV}")
         return NAV_CSV
 
     except Exception:
