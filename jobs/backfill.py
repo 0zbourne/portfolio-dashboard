@@ -245,7 +245,6 @@ def _download_fx_usd_gbp(start: date, end: date) -> pd.Series:
                 continue
             raise RuntimeError(f"FX API unavailable after 3 attempts: {e}") from e
 
-
 def _download_prices(
     yf_map: dict[str, tuple[str, str]], 
     start: date, 
