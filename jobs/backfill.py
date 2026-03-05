@@ -70,7 +70,17 @@ def _paged_get(url: str):
         next_url = API_BASE.rstrip("/") + next_path
         time.sleep(2.1)
     return items
-
+    
+def _fetch_cash_balance() -> dict:
+    """Fetch current cash balance from Trading212."""
+    try:
+        url = f"{API_BASE}/api/v0/equity/account/cash"
+        r = requests.get(url, headers=_t212_headers(), timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[WARN] Failed to fetch cash balance: {e}")
+        return {}
 
 def _load_overrides() -> dict:
     """Load ticker overrides from JSON file. Keys normalized to uppercase for matching."""
@@ -385,6 +395,22 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         pos = pos[keep]
         prices = prices[keep]
 
+        # === BUILD CASH TIMESERIES ===
+        # Fetch current cash balance and assume it grew linearly from £0 at start
+        cash_info = _fetch_cash_balance()
+        current_cash = float(cash_info.get("free", 0.0) or 0.0)
+        print(f"[INFO] Current cash balance from T212: £{current_cash:.2f}")
+        
+        # Simple approach: assume cash grew linearly from £0 at start to current
+        # This is a rough approximation but better than ignoring cash entirely
+        cash_series = pd.Series(0.0, index=full_idx)
+        if current_cash > 0 and len(full_idx) > 0:
+            # Linear interpolation from 0 to current cash
+            cash_series = pd.Series(
+                np.linspace(0, current_cash, len(full_idx)),
+                index=full_idx
+            )
+
         # 6) Forward fill
         full_idx = pd.date_range(d0, d1, freq="D").date
         prices = prices.sort_index().reindex(full_idx).ffill().bfill().astype("float64")
@@ -398,10 +424,13 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         except Exception as e:
             print(f"[WARN] Failed to save debug caches: {e}")
 
-        # 7) Calculate NAV
+        # 7) Calculate NAV (positions + cash)
         pos_np = pos.to_numpy(dtype=np.float64, na_value=np.nan)
         prices_np = prices.to_numpy(dtype=np.float64, na_value=np.nan)
-        nav_vals = np.nansum(pos_np * prices_np, axis=1)
+        positions_value = np.nansum(pos_np * prices_np, axis=1)
+        
+        # Add cash to NAV
+        nav_vals = positions_value + cash_series.values
 
         nav = pd.DataFrame({
             "date": pd.to_datetime(full_idx).strftime("%Y-%m-%d"),
