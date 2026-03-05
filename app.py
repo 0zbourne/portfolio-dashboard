@@ -1193,3 +1193,69 @@ with st.sidebar.expander("🔧 Debug: Export Data", expanded=False):
             st.caption(f"NAV range: £{feb_slice['nav_gbp'].min():,.0f} - £{feb_slice['nav_gbp'].max():,.0f}")
         else:
             st.write("No data for Feb 2025")
+
+# =======================
+# Debug: NAV Breakdown
+# =======================
+with st.sidebar.expander("🔍 Debug: NAV Breakdown", expanded=False):
+    st.markdown("### Inspect NAV Calculation")
+    
+    if NAV_CSV.exists():
+        nav_df = pd.read_csv(NAV_CSV)
+        nav_df["date"] = pd.to_datetime(nav_df["date"])
+        
+        # Date picker
+        available_dates = nav_df["date"].dt.strftime("%Y-%m-%d").tolist()
+        default_date = "2025-02-24" if "2025-02-24" in available_dates else available_dates[-1] if available_dates else None
+        
+        selected_date = st.selectbox(
+            "Select date to inspect:",
+            options=available_dates,
+            index=available_dates.index(default_date) if default_date else 0,
+            key="nav_breakdown_date"
+        )
+        
+        if st.button("Load Breakdown", key="load_breakdown_btn"):
+            from jobs.backfill import get_nav_breakdown
+            
+            breakdown = get_nav_breakdown(selected_date)
+            
+            if breakdown is not None:
+                st.session_state["nav_breakdown_df"] = breakdown
+                st.session_state["nav_breakdown_date"] = selected_date
+            else:
+                st.error("No breakdown data available. Run NAV backfill first.")
+        
+        if "nav_breakdown_df" in st.session_state:
+            bd = st.session_state["nav_breakdown_df"]
+            st.markdown(f"**NAV Breakdown for {st.session_state.get('nav_breakdown_date', selected_date)}**")
+            
+            st.dataframe(
+                bd,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "ticker": st.column_config.TextColumn("T212 Ticker"),
+                    "yf_symbol": st.column_config.TextColumn("Yahoo Symbol"),
+                    "currency": st.column_config.TextColumn("Currency"),
+                    "shares": st.column_config.NumberColumn("Shares", format="%.4f"),
+                    "price_gbp": st.column_config.NumberColumn("Price (GBP)", format="£%.4f"),
+                    "value_gbp": st.column_config.NumberColumn("Value (GBP)", format="£%.2f"),
+                }
+            )
+            
+            # Export button
+            csv_data = bd.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Breakdown CSV",
+                data=csv_data,
+                file_name=f"nav_breakdown_{selected_date}.csv",
+                mime="text/csv",
+            )
+            
+            # Show NAV from file for comparison
+            nav_on_date = nav_df[nav_df["date"].dt.strftime("%Y-%m-%d") == selected_date]
+            if not nav_on_date.empty:
+                st.caption(f"NAV from file: £{nav_on_date['nav_gbp'].iloc[0]:,.2f}")
+    else:
+        st.write("Run NAV backfill first to enable breakdown.")
