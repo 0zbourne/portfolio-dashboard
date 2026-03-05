@@ -39,5 +39,5 @@ def build_cash_flows(transactions_json_path: Path) -> pd.DataFrame:
     flows.loc[flows[action_col].str.contains("withdraw"), "amount_gbp"] *= -1
 
     d = pd.to_datetime(flows[date_col], errors="coerce", utc=True).dt.tz_convert(None)
-    flows["date"] = d.dt.date
+    flows["date"] = d  # Keep full datetime, not just date
     return flows[["date", "amount_gbp"]].assign(kind="external")
