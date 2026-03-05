@@ -82,6 +82,98 @@ def _fetch_cash_balance() -> dict:
         print(f"[WARN] Failed to fetch cash balance: {e}")
         return {}
 
+def _fetch_transactions(start: date, end: date) -> list:
+    """Fetch all transactions (orders, dividends, deposits, interest) from Trading212."""
+    try:
+        # Try the transactions endpoint
+        url = f"{API_BASE}/api/v0/history/transactions"
+        params = {"from": str(start), "to": str(end)}
+        r = requests.get(url, headers=_t212_headers(), timeout=20, params=params)
+        r.raise_for_status()
+        payload = r.json()
+        items = payload.get("items", payload if isinstance(payload, list) else [])
+        return items
+    except Exception as e:
+        print(f"[WARN] Failed to fetch transactions: {e}")
+        return []
+
+def _build_cash_ledger(transactions: list, start: date, end: date) -> pd.Series:
+    """
+    Build a cash ledger from transactions.
+    Returns Series with index=dates, values=cumulative cash balance.
+    """
+    if not transactions:
+        print("[WARN] No transactions to build cash ledger")
+        # Return zero cash for all dates
+        idx = pd.date_range(start, end, freq="D").date
+        return pd.Series(0.0, index=idx)
+    
+    # Parse transactions into DataFrame
+    rows = []
+    for tx in transactions:
+        action = tx.get("action", tx.get("Action", "")).strip().lower()
+        time_str = tx.get("time", tx.get("Time", tx.get("date", "")))
+        total = tx.get("total", tx.get("Total", 0))
+        
+        # Parse amount - handle various field names
+        if total:
+            amount = float(total) if not isinstance(total, dict) else float(total.get("GBP", 0))
+        else:
+            # Try to get amount from other fields
+            amount = float(tx.get("amount", tx.get("Result", 0)))
+        
+        # Parse date
+        try:
+            tx_date = pd.to_datetime(time_str).date()
+        except:
+            continue
+        
+        # Determine cash flow direction
+        cash_flow = 0.0
+        if "sell" in action:
+            cash_flow = abs(amount)  # Selling adds cash
+        elif "buy" in action:
+            cash_flow = -abs(amount)  # Buying removes cash
+        elif "dividend" in action:
+            cash_flow = abs(amount)  # Dividends add cash
+        elif "deposit" in action:
+            cash_flow = abs(amount)  # Deposits add cash
+        elif "withdraw" in action:
+            cash_flow = -abs(amount)  # Withdrawals remove cash
+        elif "interest" in action:
+            cash_flow = abs(amount)  # Interest adds cash
+        else:
+            # Unknown action - check if it's positive or negative
+            if amount > 0:
+                cash_flow = amount
+            else:
+                cash_flow = amount
+        
+        rows.append({"date": tx_date, "cash_flow": cash_flow})
+    
+    if not rows:
+        idx = pd.date_range(start, end, freq="D").date
+        return pd.Series(0.0, index=idx)
+    
+    df = pd.DataFrame(rows)
+    df = df.groupby("date")["cash_flow"].sum().sort_index()
+    
+    # Build cumulative cash balance
+    idx = pd.date_range(start, end, freq="D").date
+    cash = pd.Series(0.0, index=idx)
+    
+    # Cumulative sum of cash flows
+    cumsum = df.cumsum()
+    
+    # Map to daily index (forward fill)
+    for d in idx:
+        flows_on_or_before = cumsum[cumsum.index <= d]
+        if len(flows_on_or_before) > 0:
+            cash.loc[d] = flows_on_or_before.iloc[-1]
+    
+    print(f"[INFO] Built cash ledger: {len(rows)} transactions, final cash: £{cash.iloc[-1]:.2f}")
+    return cash
+
 def _load_overrides() -> dict:
     """Load ticker overrides from JSON file. Keys normalized to uppercase for matching."""
     if OVERRIDES_PATH.exists():
@@ -396,19 +488,24 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         prices = prices[keep]
 
         # === BUILD CASH TIMESERIES ===
-        # Fetch current cash balance and assume it grew linearly from £0 at start
-        cash_info = _fetch_cash_balance()
-        current_cash = float(cash_info.get("free", 0.0) or 0.0)
-        print(f"[INFO] Current cash balance from T212: £{current_cash:.2f}")
-        
-        # Use pos.index (same dates as full_idx) which is guaranteed to exist here
-        cash_series = pd.Series(0.0, index=pos.index)
-        if current_cash > 0 and len(pos.index) > 0:
-            # Linear interpolation from 0 to current cash
-            cash_series = pd.Series(
-                np.linspace(0, current_cash, len(pos.index)),
-                index=pos.index
-            )
+        # Fetch all transactions and build proper cash ledger
+        transactions = _fetch_transactions(d0, d1)
+        if transactions:
+            cash_series = _build_cash_ledger(transactions, d0, d1)
+            # Reindex to match position dates
+            cash_series = cash_series.reindex(pos.index, method="ffill").fillna(0.0)
+        else:
+            # Fallback to linear interpolation if transactions unavailable
+            print("[WARN] No transactions fetched, using linear cash interpolation")
+            cash_info = _fetch_cash_balance()
+            current_cash = float(cash_info.get("free", 0.0) or 0.0)
+            print(f"[INFO] Current cash balance from T212: £{current_cash:.2f}")
+            cash_series = pd.Series(0.0, index=pos.index)
+            if current_cash > 0 and len(pos.index) > 0:
+                cash_series = pd.Series(
+                    np.linspace(0, current_cash, len(pos.index)),
+                    index=pos.index
+                )
 
         # 6) Forward fill
         full_idx = pd.date_range(d0, d1, freq="D").date
