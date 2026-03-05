@@ -1143,60 +1143,84 @@ except Exception as e:
             st.write("Flow dates NOT in NAV:", mismatch)
 
 # =======================
-# Debug: Aug 18 Position Analysis
+# Debug: Full NAV Breakdown Aug 17-18
 # =======================
-st.subheader("Debug: Aug 18 Position Analysis")
-import datetime as dt
+st.subheader("Debug: Full NAV Breakdown Aug 17-18")
 
 try:
+    import datetime as dt
+    
+    # Load all data
     pos_path = Path("data") / "positions_cache.parquet"
     prices_path = Path("data") / "prices_cache.parquet"
     
-    if pos_path.exists() and prices_path.exists():
-        pos = pd.read_parquet(pos_path)
-        prices = pd.read_parquet(prices_path)
+    pos = pd.read_parquet(pos_path)
+    prices = pd.read_parquet(prices_path)
+    nav_csv = pd.read_csv(NAV_CSV)
+    nav_csv['date'] = pd.to_datetime(nav_csv['date'])
+    
+    aug17 = dt.date(2025, 8, 17)
+    aug18 = dt.date(2025, 8, 18)
+    
+    st.write("### 1. RAW NAV FROM CSV")
+    nav17_csv = nav_csv[nav_csv['date'].dt.date == aug17]['nav_gbp'].values[0]
+    nav18_csv = nav_csv[nav_csv['date'].dt.date == aug18]['nav_gbp'].values[0]
+    st.write(f"Aug 17 NAV (CSV): £{nav17_csv:,.2f}")
+    st.write(f"Aug 18 NAV (CSV): £{nav18_csv:,.2f}")
+    st.write(f"Difference: £{nav18_csv - nav17_csv:,.2f}")
+    
+    st.write("### 2. POSITIONS FROM PARQUET")
+    if aug17 in pos.index and aug18 in pos.index:
+        p17 = pos.loc[aug17]
+        p18 = pos.loc[aug18]
+        st.write("**Aug 17 positions:**")
+        st.write(p17[p17 > 0])
+        st.write("**Aug 18 positions:**")
+        st.write(p18[p18 > 0])
+        st.write("**Changes:**")
+        changes = p18 - p17
+        st.write(changes[changes != 0])
+    
+    st.write("### 3. PRICES FROM PARQUET")
+    if aug17 in prices.index and aug18 in prices.index:
+        pr17 = prices.loc[aug17]
+        pr18 = prices.loc[aug18]
+        price_df = pd.DataFrame({
+            'Aug 17 Price': pr17,
+            'Aug 18 Price': pr18,
+        })
+        price_df = price_df[(price_df['Aug 17 Price'] > 0) | (price_df['Aug 18 Price'] > 0)]
+        st.write(price_df)
+    
+    st.write("### 4. RECALCULATED NAV FROM PARQUET DATA")
+    if aug17 in pos.index and aug18 in prices.index:
+        calc_nav17 = (pos.loc[aug17] * prices.loc[aug17]).sum()
+        calc_nav18 = (pos.loc[aug18] * prices.loc[aug18]).sum()
+        st.write(f"Aug 17 NAV (calculated): £{calc_nav17:,.2f}")
+        st.write(f"Aug 18 NAV (calculated): £{calc_nav18:,.2f}")
+        st.write(f"Difference: £{calc_nav18 - calc_nav17:,.2f}")
         
-        aug17_date = dt.date(2025, 8, 17)
-        aug18_date = dt.date(2025, 8, 18)
-        
-        st.write("### Positions Aug 17:")
-        if aug17_date in pos.index:
-            row = pos.loc[aug17_date]
-            st.write(row[row > 0])
-        else:
-            st.write("Date not found in positions")
-        
-        st.write("### Positions Aug 18:")
-        if aug18_date in pos.index:
-            row = pos.loc[aug18_date]
-            st.write(row[row > 0])
-        else:
-            st.write("Date not found in positions")
-        
-        st.write("### Price Changes (Aug 18 vs Aug 17):")
-        if aug17_date in prices.index and aug18_date in prices.index:
-            p17 = prices.loc[aug17_date]
-            p18 = prices.loc[aug18_date]
-            change = (p18 / p17 - 1) * 100
-            st.write(change.dropna().sort_values(ascending=False))
-        else:
-            st.write("Dates not found in prices")
-            
-        st.write("### NAV Calculation:")
-        if aug17_date in pos.index and aug18_date in pos.index:
-            nav17 = (pos.loc[aug17_date] * prices.loc[aug17_date]).sum()
-            nav18 = (pos.loc[aug18_date] * prices.loc[aug18_date]).sum()
-            st.write(f"NAV Aug 17: £{nav17:,.2f}")
-            st.write(f"NAV Aug 18: £{nav18:,.2f}")
-            st.write(f"Difference: £{nav18 - nav17:,.2f}")
-            st.write(f"Expected: ~£115 (trading fees)")
-    else:
-        st.write("positions_cache.parquet or prices_cache.parquet not found")
-        st.write("Run NAV backfill first to generate these files.")
-        
-except Exception as e:
-    st.error(f"Debug error: {e}")
+        st.write("### 5. DOES CALC MATCH CSV?")
+        st.write(f"Aug 17 match: {abs(calc_nav17 - nav17_csv) < 1}")
+        st.write(f"Aug 18 match: {abs(calc_nav18 - nav18_csv) < 1}")
+    
+    st.write("### 6. POSITION × PRICE BREAKDOWN")
+    if aug18 in pos.index and aug18 in prices.index:
+        breakdown = pd.DataFrame({
+            'Shares': pos.loc[aug18],
+            'Price': prices.loc[aug18],
+            'Value': pos.loc[aug18] * prices.loc[aug18]
+        })
+        breakdown = breakdown[breakdown['Shares'] > 0]
+        breakdown = breakdown.sort_values('Value', ascending=False)
+        st.write(breakdown)
+        st.write(f"**Total: £{breakdown['Value'].sum():,.2f}**")
 
+except Exception as e:
+    st.error(f"Error: {e}")
+    import traceback
+    st.code(traceback.format_exc())
+    
 # =======================
 # Debug: Export data files
 # =======================
