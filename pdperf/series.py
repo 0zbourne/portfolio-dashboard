@@ -59,7 +59,7 @@ def daily_returns_twr(nav: pd.Series, flows: pd.DataFrame | None = None) -> pd.D
     # ---- Flows (optional) ----
     if flows is not None and not flows.empty:
         f = flows.copy()
-        f["date"] = pd.to_datetime(f["date"], errors="coerce").normalize()
+        f["date"] = pd.to_datetime(f["date"], errors="coerce").dt.normalize()
         f = f.dropna(subset=["date"])
         f["amount_gbp"] = pd.to_numeric(f["amount_gbp"], errors="coerce")
         # Sum multiple events per calendar day
