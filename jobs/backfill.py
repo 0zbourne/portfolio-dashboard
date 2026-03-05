@@ -252,7 +252,8 @@ def _download_prices(yf_map: dict[str, tuple[str, str]], start: date, end: date)
     usd_px = _dl(usd_syms)
 
     fx = _download_fx_usd_gbp(start, end) if usd_syms else pd.Series(dtype="float64")
-    fx = pd.to_numeric(fx, errors="coerce").astype("float64").reindex(cal_idx)
+    fx = pd.to_numeric(fx, errors="coerce").astype("float64").reindex(cal_idx).ffill()
+    fx = fx.bfill()  # Fill any remaining NaN at the start
     fx_np = fx.to_numpy(dtype=np.float64, na_value=np.nan) if not fx.empty else None
 
     # ---- GBP listings (yfinance returns PENCE for .L stocks) ----
