@@ -401,14 +401,13 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         current_cash = float(cash_info.get("free", 0.0) or 0.0)
         print(f"[INFO] Current cash balance from T212: £{current_cash:.2f}")
         
-        # Simple approach: assume cash grew linearly from £0 at start to current
-        # This is a rough approximation but better than ignoring cash entirely
-        cash_series = pd.Series(0.0, index=full_idx)
-        if current_cash > 0 and len(full_idx) > 0:
+        # Use pos.index (same dates as full_idx) which is guaranteed to exist here
+        cash_series = pd.Series(0.0, index=pos.index)
+        if current_cash > 0 and len(pos.index) > 0:
             # Linear interpolation from 0 to current cash
             cash_series = pd.Series(
-                np.linspace(0, current_cash, len(full_idx)),
-                index=full_idx
+                np.linspace(0, current_cash, len(pos.index)),
+                index=pos.index
             )
 
         # 6) Forward fill
