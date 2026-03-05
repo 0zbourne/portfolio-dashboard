@@ -268,7 +268,7 @@ def _download_prices(yf_map: dict[str, tuple[str, str]], start: date, end: date)
         if ysym.endswith(".L"):
             ser = ser / 100.0
 
-        out[t] = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
+        out[t] = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx).ffill().bfill()
 
     # ---- USD listings ----
     if not usd_px.empty and fx_np is not None:
@@ -278,7 +278,7 @@ def _download_prices(yf_map: dict[str, tuple[str, str]], start: date, end: date)
             if ser is None or ser.dropna().empty:
                 missing.append(t)
                 continue
-            ser = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx)
+            ser = pd.to_numeric(ser, errors="coerce").astype("float64").reindex(cal_idx).ffill().bfill()
             ser_np = ser.to_numpy(dtype=np.float64, na_value=np.nan)
             out[t] = pd.Series(ser_np * fx_np, index=cal_idx, dtype="float64")
 
@@ -325,7 +325,7 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         )
 
         d0 = datetime.strptime(start, "%Y-%m-%d").date()
-        d1 = datetime.strptime(end, "%Y-%m-%d").date() if end else datetime.now(timezone.utc).date()
+        d1 = datetime.strptime(end, "%Y-%m-%d").date() if end else datetime.now(timezone.utc).date() - timedelta(days=1)
 
         # 1) Orders from Trading212
         fetch_from = "1970-01-01"
@@ -387,7 +387,7 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
 
         # 6) Forward fill
         full_idx = pd.date_range(d0, d1, freq="D").date
-        prices = prices.sort_index().reindex(full_idx).ffill().astype("float64")
+        prices = prices.sort_index().reindex(full_idx).ffill().bfill().astype("float64")
         pos = pos.sort_index().reindex(full_idx).ffill().fillna(0.0).astype("float64")
 
         # === SAVE CACHES FOR DEBUGGING ===
