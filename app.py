@@ -1124,6 +1124,24 @@ except Exception as e:
         else:
             st.write("File not found")
 
+        # 
+        st.subheader("Debug: Flow Alignment Check")
+        flows = build_cash_flows(Path("data") / "transactions.json")
+        nav = read_nav()
+        
+        st.write("NAV dates (first 10):", nav.index[:10].tolist())
+        st.write("NAV dates (last 10):", nav.index[-10:].tolist())
+        
+        if flows is not None and not flows.empty:
+            st.write("Flow dates (first 10):", flows["date"].head(10).tolist())
+            st.write("Flow dates (last 10):", flows["date"].tail(10).tolist())
+            
+            # Check for flows that don't match NAV dates
+            flow_dates = set(pd.to_datetime(flows["date"]).dt.date)
+            nav_dates = set(nav.index.date)
+            mismatch = flow_dates - nav_dates
+            st.write("Flow dates NOT in NAV:", mismatch)
+
 # =======================
 # Debug: Export data files
 # =======================
