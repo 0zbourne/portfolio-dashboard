@@ -488,24 +488,10 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         prices = prices[keep]
 
         # === BUILD CASH TIMESERIES ===
-        # Fetch all transactions and build proper cash ledger
-        transactions = _fetch_transactions(d0, d1)
-        if transactions:
-            cash_series = _build_cash_ledger(transactions, d0, d1)
-            # Reindex to match position dates
-            cash_series = cash_series.reindex(pos.index, method="ffill").fillna(0.0)
-        else:
-            # Fallback to linear interpolation if transactions unavailable
-            print("[WARN] No transactions fetched, using linear cash interpolation")
-            cash_info = _fetch_cash_balance()
-            current_cash = float(cash_info.get("free", 0.0) or 0.0)
-            print(f"[INFO] Current cash balance from T212: £{current_cash:.2f}")
-            cash_series = pd.Series(0.0, index=pos.index)
-            if current_cash > 0 and len(pos.index) > 0:
-                cash_series = pd.Series(
-                    np.linspace(0, current_cash, len(pos.index)),
-                    index=pos.index
-                )
+        # === CASH TRACKING DISABLED ===
+        # The old working version didn't track cash - positions * prices was enough
+        # because trades are neutral (sell A, buy B = same NAV, just different holdings)
+        cash_series = pd.Series(0.0, index=pos.index)
 
         # 6) Forward fill
         full_idx = pd.date_range(d0, d1, freq="D").date
@@ -520,13 +506,10 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         except Exception as e:
             print(f"[WARN] Failed to save debug caches: {e}")
 
-        # 7) Calculate NAV (positions + cash)
+        # 7) Calculate NAV (positions only, like the old working version)
         pos_np = pos.to_numpy(dtype=np.float64, na_value=np.nan)
         prices_np = prices.to_numpy(dtype=np.float64, na_value=np.nan)
-        positions_value = np.nansum(pos_np * prices_np, axis=1)
-        
-        # Add cash to NAV
-        nav_vals = positions_value + cash_series.values
+        nav_vals = np.nansum(pos_np * prices_np, axis=1)
 
         nav = pd.DataFrame({
             "date": pd.to_datetime(full_idx).strftime("%Y-%m-%d"),
