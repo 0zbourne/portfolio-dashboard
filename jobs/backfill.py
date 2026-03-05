@@ -73,9 +73,12 @@ def _paged_get(url: str):
 
 
 def _load_overrides() -> dict:
+    """Load ticker overrides from JSON file. Keys normalized to uppercase for matching."""
     if OVERRIDES_PATH.exists():
         try:
-            return json.loads(OVERRIDES_PATH.read_text(encoding="utf-8"))
+            raw = json.loads(OVERRIDES_PATH.read_text(encoding="utf-8"))
+            # Normalize keys to upper case for case-insensitive matching
+            return {k.strip().upper(): v for k, v in raw.items()}
         except Exception:
             pass
     return {}
