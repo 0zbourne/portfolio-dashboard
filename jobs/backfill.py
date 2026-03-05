@@ -59,6 +59,13 @@ def _paged_get(url: str):
     next_url = url
     for _ in range(1000):
         r = requests.get(next_url, headers=_t212_headers(), timeout=20)
+        
+        # Handle rate limiting BEFORE raise_for_status
+        if r.status_code == 429:
+            print("[WARN] Rate limited by Trading212, waiting 60 seconds...")
+            time.sleep(60)
+            continue
+        
         r.raise_for_status()
         payload = r.json()
         chunk = payload.get("items", payload if isinstance(payload, list) else [])
