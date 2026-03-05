@@ -1143,6 +1143,61 @@ except Exception as e:
             st.write("Flow dates NOT in NAV:", mismatch)
 
 # =======================
+# Debug: Aug 18 Position Analysis
+# =======================
+st.subheader("Debug: Aug 18 Position Analysis")
+import datetime as dt
+
+try:
+    pos_path = Path("data") / "positions_cache.parquet"
+    prices_path = Path("data") / "prices_cache.parquet"
+    
+    if pos_path.exists() and prices_path.exists():
+        pos = pd.read_parquet(pos_path)
+        prices = pd.read_parquet(prices_path)
+        
+        aug17_date = dt.date(2025, 8, 17)
+        aug18_date = dt.date(2025, 8, 18)
+        
+        st.write("### Positions Aug 17:")
+        if aug17_date in pos.index:
+            row = pos.loc[aug17_date]
+            st.write(row[row > 0])
+        else:
+            st.write("Date not found in positions")
+        
+        st.write("### Positions Aug 18:")
+        if aug18_date in pos.index:
+            row = pos.loc[aug18_date]
+            st.write(row[row > 0])
+        else:
+            st.write("Date not found in positions")
+        
+        st.write("### Price Changes (Aug 18 vs Aug 17):")
+        if aug17_date in prices.index and aug18_date in prices.index:
+            p17 = prices.loc[aug17_date]
+            p18 = prices.loc[aug18_date]
+            change = (p18 / p17 - 1) * 100
+            st.write(change.dropna().sort_values(ascending=False))
+        else:
+            st.write("Dates not found in prices")
+            
+        st.write("### NAV Calculation:")
+        if aug17_date in pos.index and aug18_date in pos.index:
+            nav17 = (pos.loc[aug17_date] * prices.loc[aug17_date]).sum()
+            nav18 = (pos.loc[aug18_date] * prices.loc[aug18_date]).sum()
+            st.write(f"NAV Aug 17: £{nav17:,.2f}")
+            st.write(f"NAV Aug 18: £{nav18:,.2f}")
+            st.write(f"Difference: £{nav18 - nav17:,.2f}")
+            st.write(f"Expected: ~£115 (trading fees)")
+    else:
+        st.write("positions_cache.parquet or prices_cache.parquet not found")
+        st.write("Run NAV backfill first to generate these files.")
+        
+except Exception as e:
+    st.error(f"Debug error: {e}")
+
+# =======================
 # Debug: Export data files
 # =======================
 with st.sidebar.expander("🔧 Debug: Export Data", expanded=False):
