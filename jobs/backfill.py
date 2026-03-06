@@ -266,6 +266,12 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
     orders["filledAt"] = pd.to_datetime(orders["filledAt"], errors="coerce", utc=True).dt.date
     orders = orders.dropna(subset=["filledAt", "ticker", "filledQuantity"])
 
+    # PRINT DEBUG
+    print("=== DEBUG: ORDERS BEFORE PROCESSING ===")
+    for _, r in orders[orders["ticker"] == "LSEl_EQ"].iterrows():
+        print(f"  {r['side']} {r['filledQuantity']} @ {r['filledAt']}")
+    print(f"Total LSEl_EQ orders: {len(orders[orders['ticker'] == 'LSEl_EQ'])}")
+
     # BUY = +qty, SELL = -qty
     side_str = orders.get("side", "BUY").astype(str).str.upper()
     sign = np.where(side_str.str.startswith("S"), -1.0, 1.0)
@@ -275,18 +281,32 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
     daily = (orders.groupby(["filledAt", "ticker"], as_index=False)["signed_qty"]
                     .sum().rename(columns={"filledAt": "date"}))
 
+    # PRINT DEBUG
+    print("=== DEBUG: DAILY CHANGES FOR LSEl_EQ ===")
+    for _, r in daily[daily["ticker"] == "LSEl_EQ"].iterrows():
+        print(f"  {r['date']}: {r['signed_qty']}")
+    print(f"Total LSEl_EQ daily changes: {len(daily[daily['ticker'] == 'LSEl_EQ'])}")
+
     idx = pd.date_range(start, end, freq="D").date
     tickers = sorted(daily["ticker"].unique().tolist())
 
+    # start as pure float64
     mat = pd.DataFrame(0.0, index=idx, columns=tickers, dtype="float64")
 
-    # Step function positions (holdings carry forward)
+    # step function positions (holdings carry forward)
     for _, r in daily.iterrows():
-        d = r["date"]
-        tk = r["ticker"]
-        q = float(r["signed_qty"])
+        d = r["date"]; tk = r["ticker"]; q = float(r["signed_qty"])
         mat.loc[mat.index >= d, tk] += q
 
+    # PRINT DEBUG
+    print("=== DEBUG: FINAL POSITIONS FOR LSEl_EQ ===")
+    lseg_pos = mat["LSEl_EQ"].dropna()
+    for d, v in lseg_pos.items():
+        if v != 0:
+            print(f"  {d}: {v}")
+    print(f"Final LSEl_EQ position: {lseg_pos.iloc[-1] if len(lseg_pos) > 0 else 0}")
+
+    # drop all-zero columns and guarantee float64
     mat = mat.loc[:, (mat != 0).any(axis=0)].astype("float64")
     return mat
 
@@ -440,6 +460,14 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
         fetch_from = "1970-01-01"
         url = f"{API_BASE}/api/v0/equity/history/orders?from={fetch_from}&to={d1}"
         items = _paged_get(url)
+
+        # Debug: Show raw orders for LSEl_EQ
+        print("=== DEBUG: RAW ORDERS FOR LSEl_EQ ===")
+        lseg_orders = [o for o in items if o.get("ticker") == "LSEl_EQ"]
+        for i, o in enumerate(lseg_orders):
+            print(f"{i+1}. {o.get('side')} {o.get('filledQuantity')} @ {o.get('filledAt')}")
+        print(f"Total LSEl_EQ orders: {len(lseg_orders)}")
+        
         if not items:
             raise RuntimeError("No order history returned from Trading212.")
 
