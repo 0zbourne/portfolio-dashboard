@@ -273,9 +273,10 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
     print(f"Total LSEl_EQ orders: {len(orders[orders['ticker'] == 'LSEl_EQ'])}")
 
     # BUY = +qty, SELL = -qty
+    # Take absolute value because T212 returns negative quantities for SELLs
     side_str = orders.get("side", "BUY").astype(str).str.upper()
     sign = np.where(side_str.str.startswith("S"), -1.0, 1.0)
-    qty = pd.to_numeric(orders["filledQuantity"], errors="coerce").astype("float64")
+    qty = pd.to_numeric(orders["filledQuantity"], errors="coerce").astype("float64").abs()
     orders["signed_qty"] = qty * sign
 
     daily = (orders.groupby(["filledAt", "ticker"], as_index=False)["signed_qty"]
