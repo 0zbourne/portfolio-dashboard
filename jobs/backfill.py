@@ -1,4 +1,8 @@
 # jobs/backfill.py
+"""
+Trading212 Order History → NAV Backfill with yfinance Prices
+Includes debug export for granular NAV breakdown analysis.
+"""
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime, timedelta, date, timezone
@@ -34,6 +38,9 @@ try:
 except Exception:
     yf = None
 
+# ---------------------------
+# Configuration
+# ---------------------------
 API_BASE = os.getenv("T212_API_BASE", "https://live.trading212.com")
 API_KEY = os.getenv("T212_API_KEY")
 
@@ -220,12 +227,12 @@ def _get_yf_symbol_from_t212(t212_ticker: str) -> str | None:
 
 def _infer_yf_symbol(t212_ticker: str, overrides: dict) -> tuple[str | None, str]:
     """
-    Map a Trading212 ticker to a Yahoo Finance symbol.
-    Returns (yf_symbol_or_none, listing_ccy 'GBP'|'USD'|None)
+    Map Trading212 ticker to Yahoo Finance symbol.
+    Returns (yf_symbol_or_none, currency 'GBP'|'USD'|None)
     """
     t = (t212_ticker or "").strip().upper()
 
-    # 1) Explicit override wins
+    # 1) Explicit override
     if t in overrides:
         v = overrides[t]
         if isinstance(v, dict):
@@ -233,7 +240,7 @@ def _infer_yf_symbol(t212_ticker: str, overrides: dict) -> tuple[str | None, str
         if isinstance(v, str):
             return v, "GBP"
 
-    # 2) US listings (e.g. AAPL_US_EQ → AAPL, USD)
+    # 2) US listings
     if "_US_" in t:
         core = t.split("_")[0]
         return core, "USD"
@@ -254,9 +261,8 @@ def _infer_yf_symbol(t212_ticker: str, overrides: dict) -> tuple[str | None, str
 
 def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     """
-    orders columns expected: ['ticker','side','filledQuantity','filledAt'].
-    side: BUY/SELL. filledQuantity positive numbers.
-    Returns DataFrame index=dates, columns=tickers, values=shares held (float64).
+    Build daily position quantities from orders.
+    Returns DataFrame: index=dates, columns=tickers, values=shares held.
     """
     if orders.empty:
         idx = pd.date_range(start, end, freq="D").date
@@ -280,7 +286,7 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
     orders["signed_qty"] = qty * sign
 
     daily = (orders.groupby(["filledAt", "ticker"], as_index=False)["signed_qty"]
-                    .sum().rename(columns={"filledAt": "date"}))
+             .sum().rename(columns={"filledAt": "date"}))
 
     # Debug: Check daily aggregation
     print("=== DEBUG: DAILY AGGREGATION CHECK ===")
@@ -298,13 +304,12 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
 
     idx = pd.date_range(start, end, freq="D").date
     tickers = sorted(daily["ticker"].unique().tolist())
-
-    # start as pure float64
     mat = pd.DataFrame(0.0, index=idx, columns=tickers, dtype="float64")
 
-    # step function positions (holdings carry forward)
     for _, r in daily.iterrows():
-        d = r["date"]; tk = r["ticker"]; q = float(r["signed_qty"])
+        d = r["date"]
+        tk = r["ticker"]
+        q = float(r["signed_qty"])
         mat.loc[mat.index >= d, tk] += q
 
     # PRINT DEBUG
@@ -321,6 +326,7 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
 
 
 def _download_fx_usd_gbp(start: date, end: date) -> pd.Series:
+    """Fetch USD→GBP rates from Frankfurter API."""
     url = f"https://api.frankfurter.app/{start}..{end}"
     r = requests.get(url, params={"from": "USD", "to": "GBP"}, timeout=20)
     r.raise_for_status()
@@ -423,7 +429,47 @@ def _download_prices(yf_map: dict[str, tuple[str, str]], start: date, end: date)
     for c in out.columns:
         out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
 
-    return out, missing
+# ---------------------------
+# Core: Fetch Raw Data
+# ---------------------------
+def _fetch_orders(end_date: date) -> pd.DataFrame:
+    """Fetch and normalize Trading212 orders."""
+    fetch_from = "1970-01-01"
+    url = f"{API_BASE}/api/v0/equity/history/orders?from={fetch_from}&to={end_date}"
+    items = _paged_get(url)
+    if not items:
+        raise RuntimeError("No order history returned from Trading212.")
+
+    o = pd.json_normalize(items)
+
+    # Status filter
+    status_col = next((c for c in ["status", "order.status"] if c in o.columns), None)
+    if status_col:
+        o = o[o[status_col].astype(str).str.upper().eq("FILLED")]
+
+    # Column detection
+    time_col = next((c for c in ["fill.filledAt", "filledAt", "order.filledAt", "order.createdAt"] if c in o.columns), None)
+    if time_col is None:
+        time_col = next((c for c in o.columns if str(c).endswith(".filledAt") or str(c).endswith("filledAt")), None)
+    if time_col is None:
+        raise RuntimeError(f"Could not find fill timestamp. Columns: {list(o.columns)}")
+
+    ticker_col = next((c for c in ["order.ticker", "order.instrument.ticker", "ticker"] if c in o.columns), None)
+    if ticker_col is None:
+        raise RuntimeError(f"Could not find ticker column. Columns: {list(o.columns)}")
+
+    qty_col = next((c for c in ["fill.quantity", "order.filledQuantity", "filledQuantity"] if c in o.columns), None)
+    if qty_col is None:
+        raise RuntimeError(f"Could not find quantity column. Columns: {list(o.columns)}")
+
+    side_col = next((c for c in ["order.side", "side"] if c in o.columns), None)
+
+    return pd.DataFrame({
+        "ticker": o[ticker_col],
+        "filledQuantity": o[qty_col],
+        "filledAt": o[time_col],
+        "side": o[side_col] if side_col else "BUY",
+    })
 
 
 def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) -> Path:
@@ -433,21 +479,19 @@ def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) 
     """
     import traceback
 
-    trace_path = DATA_DIR / "_backfill_trace.txt"
+# ---------------------------
+# Main: NAV Backfill
+# ---------------------------
+def backfill_nav_from_orders(start: str = "2025-01-01", end: str | None = None) -> Path:
+    """Rebuild nav_daily.csv from Trading212 orders + yfinance prices."""
 
     def _dump_trace(stage: str, pos=None, prices=None):
         try:
-            with open(trace_path, "w", encoding="utf-8") as f:
-                f.write(f"[STAGE] {stage}\n\n")
-                f.write("[TRACEBACK]\n")
+            with open(TRACE_PATH, "w", encoding="utf-8") as f:
+                f.write(f"[STAGE] {stage}\n\n[TRACEBACK]\n")
                 f.write(traceback.format_exc())
-                f.write("\n")
                 if pos is not None:
-                    f.write("\n[positions.dtypes]\n")
-                    f.write(str(pos.dtypes) + "\n")
-                    bad = pos.select_dtypes(exclude=["float64"])
-                    if not bad.empty:
-                        f.write("non_float_positions: " + str(bad.columns.tolist()) + "\n")
+                    f.write(f"\n[positions.dtypes]\n{pos.dtypes}\n")
                 if prices is not None:
                     f.write("\n[prices.dtypes]\n")
                     f.write(str(prices.dtypes) + "\n")
