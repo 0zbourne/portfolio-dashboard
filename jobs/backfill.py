@@ -281,6 +281,14 @@ def _build_position_timeseries(orders: pd.DataFrame, start: date, end: date) -> 
     daily = (orders.groupby(["filledAt", "ticker"], as_index=False)["signed_qty"]
                     .sum().rename(columns={"filledAt": "date"}))
 
+    # Debug: Check daily aggregation
+    print("=== DEBUG: DAILY AGGREGATION CHECK ===")
+    lseg_daily = daily[daily["ticker"] == "LSEl_EQ"]
+    print(f"Columns: {daily.columns.tolist()}")
+    print(f"LSEl_EQ daily data:")
+    print(lseg_daily.to_string())
+    print(f"signed_qty values: {lseg_daily['signed_qty'].tolist()}")
+    
     # PRINT DEBUG
     print("=== DEBUG: DAILY CHANGES FOR LSEl_EQ ===")
     for _, r in daily[daily["ticker"] == "LSEl_EQ"].iterrows():
