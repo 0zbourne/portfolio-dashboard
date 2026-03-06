@@ -1143,6 +1143,52 @@ except Exception as e:
             st.write("Flow dates NOT in NAV:", mismatch)
 
 # =======================
+# Debug: Raw Tickers from T212 API
+# =======================
+st.subheader("Debug: Raw Tickers from T212 API")
+
+try:
+    import os
+    import requests
+    
+    # Fetch orders directly from T212
+    url = "https://live.trading212.com/api/v0/equity/history/orders"
+    headers = {"Authorization": os.getenv("T212_API_KEY"), "Accept": "application/json"}
+    r = requests.get(url, headers=headers, timeout=20, params={"from": "2025-01-01", "to": "2025-08-31"})
+    
+    if r.status_code == 200:
+        orders = r.json().get("items", [])
+        
+        # Get unique tickers
+        tickers = set()
+        lseg_orders = []
+        for o in orders:
+            # Try different possible ticker field names
+            t = o.get("ticker") or o.get("order", {}).get("ticker") or o.get("order", {}).get("instrument", {}).get("ticker")
+            if t:
+                tickers.add(t)
+                if "LSE" in str(t).upper():
+                    lseg_orders.append({
+                        "ticker": t,
+                        "side": o.get("side") or o.get("order", {}).get("side"),
+                        "qty": o.get("filledQuantity") or o.get("fill", {}).get("quantity") or o.get("order", {}).get("filledQuantity"),
+                        "date": o.get("filledAt") or o.get("fill", {}).get("filledAt") or o.get("order", {}).get("filledAt")
+                    })
+        
+        st.write("### All unique tickers from API:")
+        st.write(sorted(tickers))
+        
+        st.write("### LSEG-related orders:")
+        st.write(lseg_orders)
+    else:
+        st.write(f"API error: {r.status_code}")
+        
+except Exception as e:
+    st.error(f"Error: {e}")
+    import traceback
+    st.code(traceback.format_exc())
+
+# =======================
 # Debug: Full NAV Breakdown Aug 17-18
 # =======================
 st.subheader("Debug: Full NAV Breakdown Aug 17-18")
