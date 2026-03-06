@@ -1,7 +1,8 @@
 # stdlib
 import json
 import os
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # third-party
@@ -12,7 +13,7 @@ import streamlit as st
 import altair as alt
 from jobs.fundamentals import ensure_fundamentals, load_fundamentals
 
-# ---- FORCE NUMPY BACKEND (disable Arrow/StrDType) ----
+# ---- FORCE NUMPY BACKEND (disable Arrow/StrDtype) ----
 try:
     pd.options.mode.dtype_backend = "numpy"
 except Exception:
@@ -22,9 +23,132 @@ try:
 except Exception:
     pass
 
+# ---- CURRENCY DETECTION (integrated) ----
+CURRENCY_CACHE_PATH = Path("data") / "currency_cache.json"
+
+def _load_currency_cache() -> dict:
+    """Load cached currency data from file."""
+    if CURRENCY_CACHE_PATH.exists():
+        try:
+            return json.loads(CURRENCY_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+def _save_currency_cache(data: dict):
+    """Save currency cache to file."""
+    CURRENCY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CURRENCY_CACHE_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def _get_yf_symbol_from_t212(t212_ticker: str) -> str | None:
+    """Convert T212 ticker to yfinance symbol for currency lookup."""
+    t = (t212_ticker or "").strip().upper()
+    
+    # US stocks - no suffix
+    if "_US_" in t:
+        return t.split("_")[0]
+    
+    # UK stocks - add .L suffix
+    core = t.replace("_GBX", "").replace("_GB", "").replace("_EQ", "")
+    core = core.split("_")[0]
+    
+    # Strip trailing 'L' if present (e.g., "RMVL" -> "RMV")
+    if core.endswith("L") and len(core) >= 4:
+        core = core[:-1]
+    
+    if core and core.isalpha() and 1 <= len(core) <= 5:
+        return f"{core}.L"
+    
+    return None
+
+@st.cache_data(ttl=24 * 3600)
+def get_yf_currency_cached(ysym: str) -> str:
+    """
+    Query yfinance for the actual currency of a ticker.
+    Returns: "GBX" (pence), "GBP" (pounds), "USD", "EUR", etc.
+    """
+    if not ysym:
+        return "USD"
+    
+    # Check file cache first
+    cache = _load_currency_cache()
+    if ysym in cache:
+        return cache[ysym]
+    
+    # Try to import yfinance
+    try:
+        import yfinance as yf
+    except Exception:
+        # Fallback to suffix-based guess
+        return "GBX" if ysym.endswith(".L") else "USD"
+    
+    try:
+        ticker = yf.Ticker(ysym)
+        info = ticker.info or {}
+        raw_ccy = info.get("currency", "")
+        
+        # Normalize yfinance currency codes
+        ccy_upper = str(raw_ccy).upper().strip()
+        
+        # yfinance returns 'GBp' for pence, 'GBP' for pounds
+        if ccy_upper in ("GBX", "GBP", "GBPOUND", "PENCE", "PENNY", "GB PENCE"):
+            result = "GBX"
+        elif ccy_upper == "GBP":
+            result = "GBP"
+        elif ccy_upper in ("USD", "US DOLLAR"):
+            result = "USD"
+        elif ccy_upper in ("EUR", "EURO"):
+            result = "EUR"
+        elif ccy_upper:
+            result = ccy_upper
+        else:
+            # Fallback to suffix-based guess
+            result = "GBX" if ysym.endswith(".L") else "USD"
+        
+        # Cache the result
+        cache[ysym] = result
+        _save_currency_cache(cache)
+        
+        # Small delay to avoid rate limiting
+        time.sleep(0.1)
+        
+        return result
+        
+    except Exception:
+        # Fallback to suffix-based guess
+        result = "GBX" if ysym.endswith(".L") else "USD"
+        cache[ysym] = result
+        _save_currency_cache(cache)
+        return result
+
+def convert_price_to_gbp(price: float, currency: str, fx_rate: float = 1.0) -> float:
+    """
+    Convert a price to GBP based on its currency.
+    
+    Args:
+        price: The raw price from yfinance/T212
+        currency: "GBX" (pence), "GBP", "USD", "EUR", etc.
+        fx_rate: USD to GBP rate (for USD conversions)
+    
+    Returns:
+        Price in GBP
+    """
+    if currency == "GBX":
+        return price / 100.0  # Pence to pounds
+    elif currency == "GBP":
+        return price  # Already in pounds
+    elif currency == "USD":
+        return price * fx_rate
+    elif currency == "EUR":
+        return price * fx_rate * 0.85  # Rough EUR/GBP approximation
+    else:
+        return price  # Unknown, assume GBP
+
+# ---- END CURRENCY DETECTION ----
+
 def _freshness(path: Path) -> str:
     try:
-        ts = datetime.fromtimestamp(path.stat().st_mtime)
+        ts = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
         return ts.strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         return "unknown"
@@ -78,6 +202,9 @@ st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
 DATA = Path("data") / "portfolio.json"
 OPEN_FILE = Path("data") / "open_prices.json"
 ACC_FILE = Path("data") / "account.json"
+NAV_CSV = Path("data") / "nav_daily.csv"
+REPORT = Path("data") / "backfill_report.json"
+OVERRIDES_PATH = Path("data") / "ticker_overrides.json"
 
 def _load_open_prices():
     if OPEN_FILE.exists():
@@ -140,7 +267,7 @@ def _fetch_json_quiet(url: str, timeout: int = 10):
 
 def get_cash_gbp(base_url: str) -> tuple[float | None, str]:
     try:
-        if ACC_FILE.exists() and (datetime.utcnow().timestamp() - ACC_FILE.stat().st_mtime) < 6*3600:
+        if ACC_FILE.exists() and (datetime.now(timezone.utc).timestamp() - ACC_FILE.stat().st_mtime) < 6*3600:
             data = json.loads(ACC_FILE.read_text(encoding="utf-8"))
             val, path = _extract_cash_from_json(data)
             if val is not None:
@@ -169,7 +296,7 @@ def get_cash_gbp(base_url: str) -> tuple[float | None, str]:
     return None, "unavailable"
 
 def _anchor_date_iso():
-    d = datetime.utcnow().date()
+    d = datetime.now(timezone.utc).date()
     if d.weekday() == 5:
         d = d - timedelta(days=1)
     elif d.weekday() == 6:
@@ -209,11 +336,8 @@ def load_portfolio(cache_bust: tuple):
     df["shares"] = pd.to_numeric(df["shares"], errors="coerce").fillna(0).astype(int)
     df["price_raw"] = pd.to_numeric(df["price_raw"], errors="coerce")
 
-    df["price_gbp_guess"] = np.where(
-        (df["price_raw"].notna()) & (df["price_raw"] > 1000),
-        df["price_raw"] / 100.0,
-        df["price_raw"],
-    )
+    # DO NOT use threshold guessing - currency fetched from yfinance
+    df["price_gbp_guess"] = df["price_raw"]  # Placeholder, will be replaced
     df["market_value_gbp_guess"] = df["shares"] * df["price_gbp_guess"]
     return df
 
@@ -353,7 +477,7 @@ def get_usd_gbp_rate():
         )
         r.raise_for_status()
         rate = float(r.json()["rates"]["GBP"])
-        return rate, "frankfurter.app (ECB)", datetime.utcnow().isoformat() + "Z"
+        return rate, "frankfurter.app (ECB)", datetime.now(timezone.utc).isoformat()
     except Exception:
         pass
     return None, None, None
@@ -381,14 +505,32 @@ with st.sidebar.expander("Day change settings", expanded=False):
         _save_open_prices(_store)
         st.success("Today's open prices reset. Reload to re-anchor.")
 
+# ---- FETCH CURRENCIES FOR ALL TICKERS ----
+# This replaces the broken threshold-based guessing
+ticker_currencies = {}
+with st.spinner("Fetching currency info from yfinance..."):
+    for sym in df["symbol"].unique():
+        ysym = _get_yf_symbol_from_t212(sym)
+        if ysym:
+            ticker_currencies[sym] = get_yf_currency_cached(ysym)
+        else:
+            ticker_currencies[sym] = "GBP"  # Default fallback
+
+# Show currency mapping in debug
+with st.sidebar.expander("Currency mapping", expanded=False):
+    for sym, ccy in sorted(ticker_currencies.items()):
+        ysym = _get_yf_symbol_from_t212(sym) or "N/A"
+        st.caption(f"{sym} → {ysym} → {ccy}")
+
 def gbp_price(row):
+    """Convert price to GBP using ACTUAL currency from yfinance."""
     p = row["price_raw"]
     sym = str(row["symbol"])
-    if p is None:
+    if pd.isna(p):
         return None
-    if "_US_" in sym:
-        return float(p) * usd_to_gbp
-    return float(row["price_gbp_guess"])
+    
+    ccy = ticker_currencies.get(sym, "GBP")
+    return convert_price_to_gbp(float(p), ccy, usd_to_gbp)
 
 df["price_gbp"] = df.apply(gbp_price, axis=1)
 df["market_value_gbp"] = df["shares"] * df["price_gbp"]
@@ -399,7 +541,7 @@ c1.metric("Positions", f"{len(df):,}")
 c2.metric("Total Shares", f"{int(df['shares'].sum()):,}")
 c3.metric("Market Value (GBP)", f"£{df['market_value_gbp'].sum():,.0f}")
 
-st.caption("GBX handled automatically; USD converted via the sidebar rate.")
+st.caption("Currency fetched from yfinance (GBX = pence, divided by 100; USD converted via FX rate).")
 
 # =======================
 # Dividends loader
@@ -429,11 +571,11 @@ def load_dividends_t212(path=DIV_FILE):
         return None, f"Unexpected columns: {list(df_div.columns)}"
 
     paid = df_div["paidOn"].astype(str).str.strip().str.replace("Z", "", regex=False)
-    dt = pd.to_datetime(paid, errors="coerce")
+    dt = pd.to_datetime(paid, errors="coerce", utc=True)
     if dt.isna().all():
-        dt = pd.to_datetime(paid, format="%Y-%m-%d", errors="coerce")
+        dt = pd.to_datetime(paid, format="%Y-%m-%d", errors="coerce", utc=True)
     if dt.isna().all():
-        dt = pd.to_datetime(paid, unit="ms", errors="coerce")
+        dt = pd.to_datetime(paid, unit="ms", errors="coerce", utc=True)
 
     df_div["dt"] = dt
     if df_div["dt"].isna().all():
@@ -457,26 +599,38 @@ avg_candidates = [c for c in df.columns if "average" in c.lower() and "price" in
 df["avg_cost_raw"] = pd.to_numeric(df[avg_candidates[0]], errors="coerce") if avg_candidates else None
 
 def _ccy(sym: str) -> str:
-    return "USD" if "_US_" in str(sym) else "GBP"
+    """Return display currency (USD or GBP)."""
+    return ticker_currencies.get(sym, "GBP")
 
 df["ccy"] = df["symbol"].apply(_ccy)
 df["avg_cost_raw"] = pd.to_numeric(df["avg_cost_raw"], errors="coerce")
 
 def _price_native(row):
+    """Get native price (no conversion)."""
     p = row["price_raw"]
     if pd.isna(p):
         return np.nan
-    if row["ccy"] == "USD":
+    ccy = ticker_currencies.get(row["symbol"], "GBP")
+    # If GBX, show as pence value for display (divide later for GBP)
+    if ccy == "GBX":
+        return float(p) / 100.0  # Show in pounds for consistency
+    elif ccy == "USD":
         return float(p)
-    return float(p) / 100.0 if p > 1000 else float(p)
+    else:
+        return float(p)
 
 def _avg_native(row):
+    """Get native average cost (no conversion)."""
     x = row["avg_cost_raw"]
     if pd.isna(x):
         return np.nan
-    if row["ccy"] == "USD":
+    ccy = ticker_currencies.get(row["symbol"], "GBP")
+    if ccy == "GBX":
+        return float(x) / 100.0  # Convert pence to pounds
+    elif ccy == "USD":
         return float(x)
-    return float(x) / 100.0 if x > 1000 else float(x)
+    else:
+        return float(x)
 
 df["price_native"] = df.apply(_price_native, axis=1)
 df["avg_cost_native"] = df.apply(_avg_native, axis=1)
@@ -588,7 +742,7 @@ else:
         )
         .properties(height=280)
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
 caption = "Weights by current market value"
 if has_cash:
@@ -614,7 +768,10 @@ if prev_col:
         if v is None or pd.isna(v):
             return None
         v = float(v)
-        return v if row["ccy"] == "USD" else (v / 100.0 if v > 1000 else v)
+        ccy = ticker_currencies.get(row["symbol"], "GBP")
+        if ccy == "GBX":
+            return v / 100.0
+        return v
 
     df["prev_close_native"] = df.apply(_prev_native, axis=1)
     df["day_change_native"] = df["price_native"] - df["prev_close_native"]
@@ -632,7 +789,10 @@ else:
 def _native_to_gbp(row, v):
     if pd.isna(v):
         return float("nan")
-    return float(v) * (usd_to_gbp if row["ccy"] == "USD" else 1.0)
+    ccy = ticker_currencies.get(row["symbol"], "GBP")
+    if ccy == "USD":
+        return float(v) * usd_to_gbp
+    return float(v)
 
 df["day_change_gbp"] = df.apply(
     lambda r: r["shares"] * _native_to_gbp(r, r["day_change_native"]),
@@ -654,7 +814,10 @@ if 'sel_abs' in locals() and sel_abs != "<auto>" and sel_abs in df.columns:
         if pd.isna(val):
             return float("nan")
         scaled = (val * row["shares"]) if per_share else val
-        return float(scaled) * (usd_to_gbp if row["ccy"] == "USD" else 1.0)
+        ccy = ticker_currencies.get(row["symbol"], "GBP")
+        if ccy == "USD":
+            return float(scaled) * usd_to_gbp
+        return float(scaled)
 
     df["day_change_gbp"] = df.apply(lambda r: _to_gbp(r, tmp_abs.loc[r.name]), axis=1)
 
@@ -667,7 +830,10 @@ df["day_change_pct"] = pd.to_numeric(df["day_change_pct"], errors="coerce")
 def _gbp_from_native(row, x):
     if pd.isna(x):
         return float("nan")
-    return float(x) * (usd_to_gbp if row["ccy"] == "USD" else 1.0)
+    ccy = ticker_currencies.get(row["symbol"], "GBP")
+    if ccy == "USD":
+        return float(x) * usd_to_gbp
+    return float(x)
 
 df["true_avg_cost_gbp"] = pd.to_numeric(df["true_avg_cost_gbp"], errors="coerce")
 df["dividends_gbp"] = pd.to_numeric(df["dividends_gbp"], errors="coerce")
@@ -711,7 +877,7 @@ view = df[[
 
 st.dataframe(
     view.sort_values("total_value_gbp", ascending=False),
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
     column_config={
         "company": "Name",
@@ -771,7 +937,7 @@ try:
         from jobs.fundamentals import FUND_AUDIT, FUND_JSON
         st.caption(f"Data source: yfinance. Basis: TTM (fallback FY). Cache: weekly. File: {FUND_JSON}")
         if FUND_AUDIT.exists():
-            st.dataframe(pd.read_csv(FUND_AUDIT), use_container_width=True)
+            st.dataframe(pd.read_csv(FUND_AUDIT), width="stretch")
         else:
             st.write("Audit file not available yet.")
 except Exception as e:
@@ -788,7 +954,7 @@ if err:
     st.warning(err)
 else:
     if not is_datetime(div["dt"]):
-        div["dt"] = pd.to_datetime(div["dt"], errors="coerce")
+        div["dt"] = pd.to_datetime(div["dt"], errors="coerce", utc=True)
     div = div.dropna(subset=["dt", "amount_gbp"]).copy()
     div["amount_gbp"] = pd.to_numeric(div["amount_gbp"], errors="coerce")
     div = div.dropna(subset=["amount_gbp"])
@@ -799,11 +965,11 @@ else:
     if selected_year != "All":
         div = div[div["dt"].dt.year == int(selected_year)]
 
-    div["year_month"] = div["dt"].dt.to_period("M")
+    div["year_month"] = div["dt"].dt.tz_convert("UTC").dt.tz_localize(None).dt.to_period("M")
     monthly = div.groupby("year_month", as_index=False)["amount_gbp"].sum()
     monthly["year_month"] = monthly["year_month"].astype(str)
 
-    st.bar_chart(monthly, x="year_month", y="amount_gbp", use_container_width=True)
+    st.bar_chart(monthly, x="year_month", y="amount_gbp", width="stretch")
     st.caption("Monthly dividend cash received (GBP).")
 
 # -----------------------
@@ -869,7 +1035,7 @@ try:
     since_start_port = cumulative_return(merged, perf_start, today_key)
     since_start_bench = float((1 + merged["r_bench"]).prod() - 1) if not merged.empty else float("nan")
 
-    year_start = f"{datetime.utcnow().year}-01-01"
+    year_start = f"{datetime.now(timezone.utc).year}-01-01"
     ytd_slice = merged[(merged["date"] >= year_start) & (merged["date"] <= today_key)]
     ytd_port = float((1 + ytd_slice["r_port"]).prod() - 1) if not ytd_slice.empty else float("nan")
     ytd_bench = float((1 + ytd_slice["r_bench"]).prod() - 1) if not ytd_slice.empty else float("nan")
@@ -889,7 +1055,7 @@ try:
         plot["S&P 500 (GBP)"] = (100.0 * (1.0 + plot["r_bench"]).cumprod()).astype("float64")
 
         st.subheader("NAV vs S&P 500 (rebased to 100)")
-        st.caption(f"As of { _freshness(Path('data') / 'nav_daily.csv') }")
+        st.caption(f"As of { _freshness(NAV_CSV) }")
 
         plot_alt = plot.copy()
         plot_alt["date"] = pd.to_datetime(plot_alt["date"], errors="coerce")
@@ -923,7 +1089,317 @@ try:
             .properties(height=340)
         )
 
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width="stretch")
 
 except Exception as e:
     st.sidebar.info(f"Perf debug unavailable: {e}")
+
+    # Debug section - show file contents
+    with st.expander("Debug: Data Files", expanded=False):
+        st.subheader("nav_daily.csv")
+        if NAV_CSV.exists():
+            nav_debug = pd.read_csv(NAV_CSV)
+            st.write(f"Rows: {len(nav_debug)}")
+            st.write("First 5 rows:")
+            st.dataframe(nav_debug.head(5), width="stretch")
+            st.write("Last 5 rows:")
+            st.dataframe(nav_debug.tail(5), width="stretch")
+        else:
+            st.write("File not found")
+
+        st.subheader("backfill_report.json")
+        if REPORT.exists():
+            report_debug = json.loads(REPORT.read_text(encoding="utf-8"))
+            st.json(report_debug)
+        else:
+            st.write("File not found")
+
+        st.subheader("portfolio.json (first 2 items)")
+        if DATA.exists():
+            port_debug = json.loads(DATA.read_text(encoding="utf-8"))
+            if isinstance(port_debug, list):
+                st.json(port_debug[:2])
+            else:
+                st.json(port_debug)
+        else:
+            st.write("File not found")
+
+        # 
+        st.subheader("Debug: Flow Alignment Check")
+        flows = build_cash_flows(Path("data") / "transactions.json")
+        nav = read_nav()
+        
+        st.write("NAV dates (first 10):", nav.index[:10].tolist())
+        st.write("NAV dates (last 10):", nav.index[-10:].tolist())
+        
+        if flows is not None and not flows.empty:
+            st.write("Flow dates (first 10):", flows["date"].head(10).tolist())
+            st.write("Flow dates (last 10):", flows["date"].tail(10).tolist())
+            
+            # Check for flows that don't match NAV dates
+            flow_dates = set(pd.to_datetime(flows["date"]).dt.date)
+            nav_dates = set(nav.index.date)
+            mismatch = flow_dates - nav_dates
+            st.write("Flow dates NOT in NAV:", mismatch)
+
+# =======================
+# Debug: Raw Tickers from T212 API
+# =======================
+st.subheader("Debug: Raw Tickers from T212 API")
+
+try:
+    import os
+    import requests
+    
+    # Fetch orders directly from T212
+    url = "https://live.trading212.com/api/v0/equity/history/orders"
+    # Use the same auth function as the rest of the app (handles st.secrets too)
+    headers = _auth_header()
+    r = requests.get(url, headers=headers, timeout=20, params={"from": "2025-01-01", "to": "2025-08-31"})
+    
+    if r.status_code == 200:
+        orders = r.json().get("items", [])
+        
+        # Get unique tickers
+        tickers = set()
+        lseg_orders = []
+        for o in orders:
+            # Try different possible ticker field names
+            t = o.get("ticker") or o.get("order", {}).get("ticker") or o.get("order", {}).get("instrument", {}).get("ticker")
+            if t:
+                tickers.add(t)
+                if "LSE" in str(t).upper():
+                    lseg_orders.append({
+                        "ticker": t,
+                        "side": o.get("side") or o.get("order", {}).get("side"),
+                        "qty": o.get("filledQuantity") or o.get("fill", {}).get("quantity") or o.get("order", {}).get("filledQuantity"),
+                        "date": o.get("filledAt") or o.get("fill", {}).get("filledAt") or o.get("order", {}).get("filledAt")
+                    })
+        
+        st.write("### All unique tickers from API:")
+        st.write(sorted(tickers))
+        
+        st.write("### LSEG-related orders:")
+        st.write(lseg_orders)
+    else:
+        st.write(f"API error: {r.status_code}")
+        
+except Exception as e:
+    st.error(f"Error: {e}")
+    import traceback
+    st.code(traceback.format_exc())
+
+# =======================
+# Debug: Full NAV Breakdown Aug 17-18
+# =======================
+st.subheader("Debug: Full NAV Breakdown Aug 17-18")
+
+try:
+    import datetime as dt
+    
+    # Load all data
+    pos_path = Path("data") / "positions_cache.parquet"
+    prices_path = Path("data") / "prices_cache.parquet"
+    
+    pos = pd.read_parquet(pos_path)
+    prices = pd.read_parquet(prices_path)
+    nav_csv = pd.read_csv(NAV_CSV)
+    nav_csv['date'] = pd.to_datetime(nav_csv['date'])
+    
+    aug17 = dt.date(2025, 8, 17)
+    aug18 = dt.date(2025, 8, 18)
+    
+    st.write("### 1. RAW NAV FROM CSV")
+    nav17_csv = nav_csv[nav_csv['date'].dt.date == aug17]['nav_gbp'].values[0]
+    nav18_csv = nav_csv[nav_csv['date'].dt.date == aug18]['nav_gbp'].values[0]
+    st.write(f"Aug 17 NAV (CSV): £{nav17_csv:,.2f}")
+    st.write(f"Aug 18 NAV (CSV): £{nav18_csv:,.2f}")
+    st.write(f"Difference: £{nav18_csv - nav17_csv:,.2f}")
+    
+    st.write("### 2. POSITIONS FROM PARQUET")
+    if aug17 in pos.index and aug18 in pos.index:
+        p17 = pos.loc[aug17]
+        p18 = pos.loc[aug18]
+        st.write("**Aug 17 positions:**")
+        st.write(p17[p17 > 0])
+        st.write("**Aug 18 positions:**")
+        st.write(p18[p18 > 0])
+        st.write("**Changes:**")
+        changes = p18 - p17
+        st.write(changes[changes != 0])
+    
+    st.write("### 3. PRICES FROM PARQUET")
+    if aug17 in prices.index and aug18 in prices.index:
+        pr17 = prices.loc[aug17]
+        pr18 = prices.loc[aug18]
+        price_df = pd.DataFrame({
+            'Aug 17 Price': pr17,
+            'Aug 18 Price': pr18,
+        })
+        price_df = price_df[(price_df['Aug 17 Price'] > 0) | (price_df['Aug 18 Price'] > 0)]
+        st.write(price_df)
+    
+    st.write("### 4. RECALCULATED NAV FROM PARQUET DATA")
+    if aug17 in pos.index and aug18 in prices.index:
+        calc_nav17 = (pos.loc[aug17] * prices.loc[aug17]).sum()
+        calc_nav18 = (pos.loc[aug18] * prices.loc[aug18]).sum()
+        st.write(f"Aug 17 NAV (calculated): £{calc_nav17:,.2f}")
+        st.write(f"Aug 18 NAV (calculated): £{calc_nav18:,.2f}")
+        st.write(f"Difference: £{calc_nav18 - calc_nav17:,.2f}")
+        
+        st.write("### 5. DOES CALC MATCH CSV?")
+        st.write(f"Aug 17 match: {abs(calc_nav17 - nav17_csv) < 1}")
+        st.write(f"Aug 18 match: {abs(calc_nav18 - nav18_csv) < 1}")
+    
+    st.write("### 6. POSITION × PRICE BREAKDOWN")
+    if aug18 in pos.index and aug18 in prices.index:
+        breakdown = pd.DataFrame({
+            'Shares': pos.loc[aug18],
+            'Price': prices.loc[aug18],
+            'Value': pos.loc[aug18] * prices.loc[aug18]
+        })
+        breakdown = breakdown[breakdown['Shares'] > 0]
+        breakdown = breakdown.sort_values('Value', ascending=False)
+        st.write(breakdown)
+        st.write(f"**Total: £{breakdown['Value'].sum():,.2f}**")
+
+except Exception as e:
+    st.error(f"Error: {e}")
+    import traceback
+    st.code(traceback.format_exc())
+    
+# =======================
+# Debug: Export data files
+# =======================
+with st.sidebar.expander("🔧 Debug: Export Data", expanded=False):
+    st.markdown("### Data Files")
+
+    # nav_daily.csv
+    if NAV_CSV.exists():
+        nav_data = NAV_CSV.read_text(encoding="utf-8")
+        st.download_button(
+            label="📥 Download nav_daily.csv",
+            data=nav_data,
+            file_name="nav_daily.csv",
+            mime="text/csv",
+        )
+        st.caption(f"Rows: {len(nav_data.splitlines()) - 1}")
+    else:
+        st.write("nav_daily.csv not found")
+
+    # transactions.json
+    tx_path = Path("data") / "transactions.json"
+    if tx_path.exists():
+        tx_data = tx_path.read_text(encoding="utf-8")
+        st.download_button(
+            label="📥 Download transactions.json",
+            data=tx_data,
+            file_name="transactions.json",
+            mime="application/json",
+        )
+        st.caption(f"Size: {len(tx_data):,} bytes")
+    else:
+        st.write("transactions.json not found")
+
+    # backfill_report.json
+    if REPORT.exists():
+        rep_data = REPORT.read_text(encoding="utf-8")
+        st.download_button(
+            label="📥 Download backfill_report.json",
+            data=rep_data,
+            file_name="backfill_report.json",
+            mime="application/json",
+        )
+    else:
+        st.write("backfill_report.json not found")
+
+    # ticker_overrides.json
+    if OVERRIDES_PATH.exists():
+        ov_data = OVERRIDES_PATH.read_text(encoding="utf-8")
+        st.download_button(
+            label="📥 Download ticker_overrides.json",
+            data=ov_data,
+            file_name="ticker_overrides.json",
+            mime="application/json",
+        )
+    else:
+        st.write("ticker_overrides.json not found")
+
+    st.markdown("---")
+    st.markdown("### Inspect NAV around Feb 2025")
+
+    if NAV_CSV.exists():
+        nav_df = pd.read_csv(NAV_CSV)
+        nav_df["date"] = pd.to_datetime(nav_df["date"])
+        feb_slice = nav_df[(nav_df["date"] >= "2025-02-20") & (nav_df["date"] <= "2025-02-28")]
+        if not feb_slice.empty:
+            st.dataframe(feb_slice, width="stretch", hide_index=True)
+            st.caption(f"NAV range: £{feb_slice['nav_gbp'].min():,.0f} - £{feb_slice['nav_gbp'].max():,.0f}")
+        else:
+            st.write("No data for Feb 2025")
+
+# =======================
+# Debug: NAV Breakdown
+# =======================
+with st.sidebar.expander("🔍 Debug: NAV Breakdown", expanded=False):
+    st.markdown("### Inspect NAV Calculation")
+    
+    if NAV_CSV.exists():
+        nav_df = pd.read_csv(NAV_CSV)
+        nav_df["date"] = pd.to_datetime(nav_df["date"])
+        
+        # Date picker
+        available_dates = nav_df["date"].dt.strftime("%Y-%m-%d").tolist()
+        default_date = "2025-02-24" if "2025-02-24" in available_dates else available_dates[-1] if available_dates else None
+        
+        selected_date = st.selectbox(
+            "Select date to inspect:",
+            options=available_dates,
+            index=available_dates.index(default_date) if default_date else 0,
+            key="nav_breakdown_date"
+        )
+        
+        if st.button("Load Breakdown", key="load_breakdown_btn"):
+            from jobs.backfill import get_nav_breakdown
+            
+            breakdown = get_nav_breakdown(selected_date)
+            
+            if breakdown is not None:
+                st.session_state["nav_breakdown_df"] = breakdown
+                st.session_state["nav_breakdown_date"] = selected_date
+            else:
+                st.error("No breakdown data available. Run NAV backfill first.")
+        
+        if "nav_breakdown_df" in st.session_state:
+            bd = st.session_state["nav_breakdown_df"]
+            st.markdown(f"**NAV Breakdown for {st.session_state.get('nav_breakdown_date', selected_date)}**")
+            
+            st.dataframe(
+                bd,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "ticker": st.column_config.TextColumn("T212 Ticker"),
+                    "yf_symbol": st.column_config.TextColumn("Yahoo Symbol"),
+                    "currency": st.column_config.TextColumn("Currency"),
+                    "shares": st.column_config.NumberColumn("Shares", format="%.4f"),
+                    "price_gbp": st.column_config.NumberColumn("Price (GBP)", format="£%.4f"),
+                    "value_gbp": st.column_config.NumberColumn("Value (GBP)", format="£%.2f"),
+                }
+            )
+            
+            # Export button
+            csv_data = bd.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Breakdown CSV",
+                data=csv_data,
+                file_name=f"nav_breakdown_{selected_date}.csv",
+                mime="text/csv",
+            )
+            
+            # Show NAV from file for comparison
+            nav_on_date = nav_df[nav_df["date"].dt.strftime("%Y-%m-%d") == selected_date]
+            if not nav_on_date.empty:
+                st.caption(f"NAV from file: £{nav_on_date['nav_gbp'].iloc[0]:,.2f}")
+    else:
+        st.write("Run NAV backfill first to enable breakdown.")

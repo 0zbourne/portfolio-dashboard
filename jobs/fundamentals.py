@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 
 # reuse mapping + data dir from your backfill
-from jobs.backfill import DATA_DIR, _infer_yf_symbol, _load_overrides
+from jobs.backfill import DATA_DIR, _get_yf_symbol_from_t212, _load_overrides
 
 # Optional dependency
 try:
@@ -182,11 +182,11 @@ def _compute_metrics_for_symbol(yf_sym: str) -> dict:
     }
 
 def _map_to_yahoo(weights_t212: dict[str, float]) -> dict[str, float]:
-    """Use overrides + _infer_yf_symbol to resolve Yahoo symbols for current holdings."""
+    """Use overrides + _get_yf_symbol_from_t212 to resolve Yahoo symbols for current holdings."""
     ovr = _load_overrides()
     out = {}
     for t212, w in weights_t212.items():
-        yf_sym, _ccy = _infer_yf_symbol(t212, ovr)
+        yf_sym = _get_yf_symbol_from_t212(t212, ovr)
         if yf_sym:
             out[yf_sym] = out.get(yf_sym, 0.0) + float(w)
     return out

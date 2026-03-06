@@ -1,0 +1,14 @@
+{
+  "LSEl_EQ": {
+    "yf": "LSEG.L",
+    "ccy": "GBP"
+  },
+  "AHTL_EQ": {
+    "yf": "AHT.L",
+    "ccy": "GBP"
+  },
+  "HLMA_EQUITY": {
+    "yf": "HLMA.L",
+    "ccy": "GBP"
+  }
+}
