@@ -1153,7 +1153,10 @@ try:
     
     # Fetch orders directly from T212
     url = "https://live.trading212.com/api/v0/equity/history/orders"
-    headers = {"Authorization": os.getenv("T212_API_KEY"), "Accept": "application/json"}
+    key = os.getenv("T212_API_KEY", "").strip()
+    if key and not key.lower().startswith("apikey "):
+        key = f"Apikey {key}"
+    headers = {"Authorization": key, "Accept": "application/json"}
     r = requests.get(url, headers=headers, timeout=20, params={"from": "2025-01-01", "to": "2025-08-31"})
     
     if r.status_code == 200:
