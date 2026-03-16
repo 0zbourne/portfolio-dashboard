@@ -1,2 +1,2 @@
 # portfolio-dashboard
-Portfolio dashboard / live holdings analytics - pulling T212 / QuickFS data
+Portfolio dashboard / live holdings analytics via Streamlit - connected to T212 api
